@@ -1,0 +1,27 @@
+[workspace]
+name = "weightless"
+version = "0.1.0"
+description = "Train sparse models on FineWeb - minimize bytes_per_token_infer while achieving val loss < 3.5"
+channels = ["nvidia", "conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+train = "python train.py"
+eval = "python eval.py --checkpoint model.pt"
+visualize = "python visualize.py"
+metric = "python metric.py"
+test-data = "python data.py"
+test-model = "python model.py"
+
+[dependencies]
+python = ">=3.10,<3.13"
+pyarrow = ">=14,<19"
+cuda-toolkit = "12.4.*"
+
+[pypi-dependencies]
+torch = ">=2.0"
+transformers = ">=4.30.0"
+wandb = ">=0.15.0"
+huggingface_hub = ">=0.25.0"
+tqdm = "*"
+matplotlib = ">=3.7.0"
