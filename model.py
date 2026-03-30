@@ -3,8 +3,10 @@
 Your goal: achieve val loss < 3.3 with the lowest bytes_per_token_infer score.
 Modify this model architecture to be as sparse/efficient as possible.
 
-Three variants are provided:
+Five variants are provided:
   - baseline:       dense transformer (the starting point)
+  - gqa_only:       grouped-query attention only (dense FFN)
+  - topk_only:      top-k FFN activation sparsity only (full MHA)
   - baseline_plus:  GQA + top-k FFN activation sparsity (shows clear improvement)
   - mla:            DeepSeek-style Multi-Head Latent Attention (MLA)
 """
@@ -600,6 +602,257 @@ class BaselinePlusTransformer(SimpleTransformer):
         )
 
 
+class GQAOnlyTransformer(SimpleTransformer):
+    """Ablation: Grouped Query Attention only (dense FFN)."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_kv_heads: int = 2,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+    ):
+        nn.Module.__init__(self)
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = d_model // n_heads
+        self.weight_tied = True
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, n_kv_heads, d_ff, dropout, ffn_top_k=None)
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.token_emb.weight
+
+        self._init_weights(n_layers)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        kv_h = self.n_kv_heads
+        hd = self.head_dim
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+
+        lm_head_bytes = V * d * wb
+        if self.weight_tied and not count_reuse:
+            embedding_bytes = 0
+        else:
+            embedding_bytes = d * wb
+
+        attn_q_bytes = L * d * (h * hd) * wb
+        attn_k_bytes = L * d * (kv_h * hd) * wb
+        attn_v_bytes = L * d * (kv_h * hd) * wb
+        attn_o_bytes = L * (h * hd) * d * wb
+
+        # Dense FFN (no top-k)
+        ffn_bytes = L * (
+            d * self.d_ff
+            + self.d_ff * d
+            + d * self.d_ff
+        ) * wb
+
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
+        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="gqa_only",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=kv_h,
+            head_dim=hd,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=f"GQA only n_kv_heads={kv_h}, dense FFN",
+        )
+
+
+class TopKOnlyTransformer(SimpleTransformer):
+    """Ablation: top-k FFN activation sparsity only (full MHA KV heads)."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        ffn_top_k: int | None = None,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+    ):
+        nn.Module.__init__(self)
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads  # Full MHA K/V heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = d_model // n_heads
+        self.ffn_top_k = ffn_top_k if ffn_top_k is not None else d_ff // 4
+        self.weight_tied = True
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model,
+                n_heads,
+                n_heads,
+                d_ff,
+                dropout,
+                ffn_top_k=self.ffn_top_k,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.token_emb.weight
+
+        self._init_weights(n_layers)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        kv_h = self.n_kv_heads
+        hd = self.head_dim
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        k = self.ffn_top_k
+
+        lm_head_bytes = V * d * wb
+        if self.weight_tied and not count_reuse:
+            embedding_bytes = 0
+        else:
+            embedding_bytes = d * wb
+
+        attn_q_bytes = L * d * (h * hd) * wb
+        attn_k_bytes = L * d * (kv_h * hd) * wb
+        attn_v_bytes = L * d * (kv_h * hd) * wb
+        attn_o_bytes = L * (h * hd) * d * wb
+
+        # Top-k FFN with full MHA attention.
+        ffn_bytes = L * (
+            d * self.d_ff
+            + k * d
+            + d * self.d_ff
+        ) * wb
+
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
+        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="topk_only",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=kv_h,
+            head_dim=hd,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=f"Top-k FFN only k={k}/{self.d_ff}, full MHA n_kv_heads={kv_h}",
+        )
+
+
 class MLATransformer(SimpleTransformer):
     """Transformer variant with DeepSeek-style Multi-Head Latent Attention."""
 
@@ -781,10 +1034,14 @@ def create_model(variant: str = "baseline", **kwargs):
     """Factory function to create a model.
 
     Args:
-        variant: "baseline", "baseline_plus", or "mla"
+        variant: "baseline", "gqa_only", "topk_only", "baseline_plus", or "mla"
         **kwargs: passed to the model constructor
     """
-    if variant == "baseline_plus":
+    if variant == "gqa_only":
+        return GQAOnlyTransformer(**kwargs)
+    elif variant == "topk_only":
+        return TopKOnlyTransformer(**kwargs)
+    elif variant == "baseline_plus":
         return BaselinePlusTransformer(**kwargs)
     elif variant == "mla":
         return MLATransformer(**kwargs)
@@ -795,7 +1052,7 @@ def create_model(variant: str = "baseline", **kwargs):
 if __name__ == "__main__":
     from metric import print_profile
 
-    for variant in ["baseline", "baseline_plus", "mla"]:
+    for variant in ["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"]:
         print(f"\n{'='*60}")
         print(f"  {variant}")
         print(f"{'='*60}")

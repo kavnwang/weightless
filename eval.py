@@ -75,7 +75,7 @@ def main():
                         help="Path to model checkpoint (.pt file)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "baseline_plus", "mla"])
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)

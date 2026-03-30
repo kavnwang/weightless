@@ -215,7 +215,7 @@ def print_comparison(profiles: Dict[str, InferenceProfile]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Visualize bytes_per_token_infer")
     parser.add_argument("--models", nargs="+", default=["baseline", "baseline_plus"],
-                        choices=["baseline", "baseline_plus", "mla"],
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"],
                         help="Model variants to profile and compare")
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--d_model", type=int, default=None)

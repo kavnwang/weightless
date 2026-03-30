@@ -72,6 +72,8 @@ python train.py
 
 # With a specific model variant
 python train.py --model baseline
+python train.py --model gqa_only
+python train.py --model topk_only
 python train.py --model baseline_plus
 python train.py --model mla
 python train.py --model mla --kv_lora_rank 96 --q_lora_rank 96 --qk_rope_head_dim 48
@@ -98,11 +100,12 @@ python eval.py --checkpoint model.pt --visualize  # + save breakdown chart
 
 ## Visualization
 
-Compare baseline vs baseline+ vs mla (or any model variants):
+Compare variants (including ablations) side-by-side:
 
 ```bash
 python visualize.py                                   # compare baseline vs baseline+ by default
 python visualize.py --models baseline mla             # compare selected variants
+python visualize.py --models baseline gqa_only topk_only baseline_plus
 python visualize.py --models baseline                  # single model breakdown
 python visualize.py --seq_len 1024                     # custom context length
 ```
@@ -113,21 +116,25 @@ Profile any model variant without training:
 
 ```bash
 python metric.py --model baseline
+python metric.py --model gqa_only --seq_len 1024
+python metric.py --model topk_only --seq_len 1024
 python metric.py --model baseline_plus --seq_len 1024
 python metric.py --model mla --seq_len 1024
 ```
 
 ## Baselines
 
-Three model variants are provided:
+Five model variants are provided:
 
 | Variant | Description | bytes_per_token (bf16) | Key changes |
 |---|---|---|---|
 | `baseline` | Dense transformer | **194 MB** | Standard MHA, full SwiGLU FFN |
+| `gqa_only` | GQA ablation | Depends on `n_kv_heads` | Reduced KV heads, dense FFN |
+| `topk_only` | FFN sparsity ablation | Depends on `ffn_top_k` | Full MHA, top-k activation sparsity in FFN |
 | `baseline_plus` | GQA + top-k FFN | **153 MB** (-21%) | Fewer KV heads, activation sparsity in FFN |
 | `mla` | DeepSeek-style latent attention | Depends on MLA dims | Low-rank Q/KV compression and reduced KV cache payload |
 
-The `baseline` is your starting point. `baseline_plus` and `mla` are included as concrete architectural alternatives that reduce attention-related memory traffic. Run `python visualize.py` to see the per-component comparison.
+The `baseline` is your starting point. `gqa_only` and `topk_only` are ablations that isolate each optimization in `baseline_plus`, while `mla` is an alternative attention architecture. Run `python visualize.py` to compare per-component effects.
 
 ## Challenge
 

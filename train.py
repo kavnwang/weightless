@@ -209,8 +209,8 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "baseline_plus", "mla"],
-                        help="Model variant: baseline, baseline_plus, or mla")
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"],
+                        help="Model variant: baseline, gqa_only, topk_only, baseline_plus, or mla")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="MLA KV latent rank (d_c); only used for --model mla")
     parser.add_argument("--q_lora_rank", type=int, default=None,
