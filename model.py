@@ -3,9 +3,10 @@
 Your goal: achieve val loss < 3.3 with the lowest bytes_per_token_infer score.
 Modify this model architecture to be as sparse/efficient as possible.
 
-Two variants are provided:
+Three variants are provided:
   - baseline:       dense transformer (the starting point)
   - baseline_plus:  GQA + top-k FFN activation sparsity (shows clear improvement)
+  - mla:            DeepSeek-style Multi-Head Latent Attention (MLA)
 """
 
 import torch
@@ -278,6 +279,86 @@ class MultiHeadAttention(nn.Module):
         return self.proj(out)
 
 
+class MultiLatentAttention(nn.Module):
+    """DeepSeek-style Multi-Head Latent Attention (MLA).
+
+    Implements low-rank latent compression for keys/values and queries with
+    decoupled RoPE components:
+      - KV: h -> c_kv -> (k_c, v_c), and k_r = RoPE(W_kr h)
+      - Q:  h -> c_q  -> q_c,         and q_r = RoPE(W_qr c_q)
+      - attention uses q=[q_c;q_r], k=[k_c;k_r], v=v_c
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        kv_lora_rank: int,
+        q_lora_rank: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+    ):
+        super().__init__()
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.kv_lora_rank = kv_lora_rank
+        self.q_lora_rank = q_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+
+        assert self.qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even for RoPE"
+        assert self.kv_lora_rank > 0 and self.q_lora_rank > 0
+        assert self.qk_nope_head_dim > 0 and self.v_head_dim > 0
+
+        # KV path: h -> c_kv -> k_c / v_c
+        self.kv_down = nn.Linear(d_model, kv_lora_rank, bias=False)
+        self.k_up = nn.Linear(kv_lora_rank, n_heads * qk_nope_head_dim, bias=False)
+        self.v_up = nn.Linear(kv_lora_rank, n_heads * v_head_dim, bias=False)
+        # Decoupled RoPE key (shared across heads)
+        self.k_rope_proj = nn.Linear(d_model, qk_rope_head_dim, bias=False)
+
+        # Q path: h -> c_q -> q_c / q_r
+        self.q_down = nn.Linear(d_model, q_lora_rank, bias=False)
+        self.q_up = nn.Linear(q_lora_rank, n_heads * qk_nope_head_dim, bias=False)
+        self.q_rope_proj = nn.Linear(q_lora_rank, n_heads * qk_rope_head_dim, bias=False)
+
+        self.proj = nn.Linear(n_heads * v_head_dim, d_model, bias=False)
+
+    def forward(self, x, causal_mask, attention_mask, rope, positions):
+        B, T, _ = x.shape
+
+        # Query latent path
+        c_q = self.q_down(x)
+        q_c = self.q_up(c_q).reshape(B, T, self.n_heads, self.qk_nope_head_dim).transpose(1, 2)
+        q_r = self.q_rope_proj(c_q).reshape(B, T, self.n_heads, self.qk_rope_head_dim).transpose(1, 2)
+        q_r = rope(q_r, positions)
+        q = torch.cat([q_c, q_r], dim=-1)
+
+        # Key/Value latent path
+        c_kv = self.kv_down(x)
+        k_c = self.k_up(c_kv).reshape(B, T, self.n_heads, self.qk_nope_head_dim).transpose(1, 2)
+        v_c = self.v_up(c_kv).reshape(B, T, self.n_heads, self.v_head_dim).transpose(1, 2)
+
+        # RoPE key shared across heads
+        k_r = self.k_rope_proj(x).reshape(B, T, 1, self.qk_rope_head_dim).transpose(1, 2)
+        k_r = rope(k_r, positions).expand(B, self.n_heads, T, self.qk_rope_head_dim)
+        k = torch.cat([k_c, k_r], dim=-1)
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v_c,
+            is_causal=True,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+
+        out = out.transpose(1, 2).reshape(B, T, self.n_heads * self.v_head_dim)
+        return self.proj(out)
+
+
 # ============================================================================
 # FFN
 # ============================================================================
@@ -349,10 +430,21 @@ class TransformerBlock(nn.Module):
     """Single transformer block with pre-norm."""
     
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int,
-                 d_ff: int, dropout: float, ffn_top_k: int | None = None):
+                 d_ff: int, dropout: float, ffn_top_k: int | None = None,
+                 attention_type: str = "mha", mla_kwargs: dict | None = None):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout)
+        if attention_type == "mla":
+            if mla_kwargs is None:
+                raise ValueError("mla_kwargs must be provided when attention_type='mla'")
+            self.attn = MultiLatentAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                dropout=dropout,
+                **mla_kwargs,
+            )
+        else:
+            self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
         if ffn_top_k is not None:
             self.ff = TopKSwiGLUFF(d_model, d_ff, top_k=ffn_top_k)
@@ -508,6 +600,179 @@ class BaselinePlusTransformer(SimpleTransformer):
         )
 
 
+class MLATransformer(SimpleTransformer):
+    """Transformer variant with DeepSeek-style Multi-Head Latent Attention."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        kv_lora_rank: int | None = None,
+        q_lora_rank: int | None = None,
+        qk_nope_head_dim: int | None = None,
+        qk_rope_head_dim: int | None = None,
+        v_head_dim: int | None = None,
+    ):
+        nn.Module.__init__(self)
+
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        head_dim = d_model // n_heads
+
+        # Practical defaults for this starter codebase while keeping MLA configurable.
+        default_rope_dim = max(2, (head_dim // 2) * 2)
+        self.kv_lora_rank = kv_lora_rank if kv_lora_rank is not None else max(16, d_model // 8)
+        self.q_lora_rank = q_lora_rank if q_lora_rank is not None else max(16, d_model // 8)
+        self.qk_nope_head_dim = qk_nope_head_dim if qk_nope_head_dim is not None else head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim if qk_rope_head_dim is not None else default_rope_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even"
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = 1  # MLA caches latent KV plus shared RoPE key component
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.weight_tied = True
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        # RoPE is applied only on the decoupled q_r / k_r dimensions.
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.qk_rope_head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        mla_kwargs = {
+            "kv_lora_rank": self.kv_lora_rank,
+            "q_lora_rank": self.q_lora_rank,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+        }
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model,
+                n_heads,
+                n_heads,
+                d_ff,
+                dropout,
+                attention_type="mla",
+                mla_kwargs=mla_kwargs,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.token_emb.weight
+
+        self._init_weights(n_layers)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        """Compute bytes_per_token_infer for MLA variant."""
+        d = self.d_model
+        h = self.n_heads
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+
+        dc = self.kv_lora_rank
+        dcp = self.q_lora_rank
+        d_nope = self.qk_nope_head_dim
+        d_rope = self.qk_rope_head_dim
+        d_v = self.v_head_dim
+
+        lm_head_bytes = V * d * wb
+        if self.weight_tied and not count_reuse:
+            embedding_bytes = 0
+        else:
+            embedding_bytes = d * wb
+
+        # MLA attention projections per layer:
+        # Q path: d->dcp, dcp->h*d_nope, dcp->h*d_rope
+        attn_q_bytes = L * (
+            d * dcp
+            + dcp * (h * d_nope)
+            + dcp * (h * d_rope)
+        ) * wb
+        # K/V path: d->dc, dc->h*d_nope, dc->h*d_v, and decoupled k_rope d->d_rope
+        attn_k_bytes = L * (
+            d * dc
+            + dc * (h * d_nope)
+            + d * d_rope
+        ) * wb
+        attn_v_bytes = L * (dc * (h * d_v)) * wb
+        attn_o_bytes = L * (h * d_v) * d * wb
+
+        ffn_bytes = L * (
+            d * self.d_ff
+            + self.d_ff * d
+            + d * self.d_ff
+        ) * wb
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+
+        # MLA cache stores compressed latent c_kv plus shared RoPE key component.
+        kv_cache_token_width = dc + d_rope
+        kv_cache_read_bytes = kv_cache_token_width * seq_len * L * kb
+        kv_cache_write_bytes = kv_cache_token_width * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="mla",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"MLA dc={dc}, dcp={dcp}, qk_nope={d_nope}, "
+                f"qk_rope={d_rope}, v_head_dim={d_v}"
+            ),
+        )
+
+
 # ============================================================================
 # Factory
 # ============================================================================
@@ -516,11 +781,13 @@ def create_model(variant: str = "baseline", **kwargs):
     """Factory function to create a model.
 
     Args:
-        variant: "baseline" or "baseline_plus"
+        variant: "baseline", "baseline_plus", or "mla"
         **kwargs: passed to the model constructor
     """
     if variant == "baseline_plus":
         return BaselinePlusTransformer(**kwargs)
+    elif variant == "mla":
+        return MLATransformer(**kwargs)
     else:
         return SimpleTransformer(**kwargs)
 
@@ -528,7 +795,7 @@ def create_model(variant: str = "baseline", **kwargs):
 if __name__ == "__main__":
     from metric import print_profile
 
-    for variant in ["baseline", "baseline_plus"]:
+    for variant in ["baseline", "baseline_plus", "mla"]:
         print(f"\n{'='*60}")
         print(f"  {variant}")
         print(f"{'='*60}")

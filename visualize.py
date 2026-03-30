@@ -215,13 +215,18 @@ def print_comparison(profiles: Dict[str, InferenceProfile]) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Visualize bytes_per_token_infer")
     parser.add_argument("--models", nargs="+", default=["baseline", "baseline_plus"],
-                        choices=["baseline", "baseline_plus"],
+                        choices=["baseline", "baseline_plus", "mla"],
                         help="Model variants to profile and compare")
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--d_model", type=int, default=None)
     parser.add_argument("--n_layers", type=int, default=None)
     parser.add_argument("--n_heads", type=int, default=None)
     parser.add_argument("--d_ff", type=int, default=None)
+    parser.add_argument("--kv_lora_rank", type=int, default=None)
+    parser.add_argument("--q_lora_rank", type=int, default=None)
+    parser.add_argument("--qk_nope_head_dim", type=int, default=None)
+    parser.add_argument("--qk_rope_head_dim", type=int, default=None)
+    parser.add_argument("--v_head_dim", type=int, default=None)
     parser.add_argument("--out", type=str, default="bytes_breakdown.png",
                         help="Output image file path")
     args = parser.parse_args()
@@ -238,6 +243,16 @@ def main():
         kwargs["n_heads"] = args.n_heads
     if args.d_ff is not None:
         kwargs["d_ff"] = args.d_ff
+    if args.kv_lora_rank is not None:
+        kwargs["kv_lora_rank"] = args.kv_lora_rank
+    if args.q_lora_rank is not None:
+        kwargs["q_lora_rank"] = args.q_lora_rank
+    if args.qk_nope_head_dim is not None:
+        kwargs["qk_nope_head_dim"] = args.qk_nope_head_dim
+    if args.qk_rope_head_dim is not None:
+        kwargs["qk_rope_head_dim"] = args.qk_rope_head_dim
+    if args.v_head_dim is not None:
+        kwargs["v_head_dim"] = args.v_head_dim
 
     profiles: Dict[str, InferenceProfile] = {}
     for variant in args.models:

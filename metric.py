@@ -374,13 +374,18 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Compute bytes_per_token_infer for a model")
-    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "baseline_plus"],
+    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "baseline_plus", "mla"],
                         help="Model variant to profile")
     parser.add_argument("--seq_len", type=int, default=512, help="Context length for KV cache")
     parser.add_argument("--d_model", type=int, default=None)
     parser.add_argument("--n_layers", type=int, default=None)
     parser.add_argument("--n_heads", type=int, default=None)
     parser.add_argument("--d_ff", type=int, default=None)
+    parser.add_argument("--kv_lora_rank", type=int, default=None)
+    parser.add_argument("--q_lora_rank", type=int, default=None)
+    parser.add_argument("--qk_nope_head_dim", type=int, default=None)
+    parser.add_argument("--qk_rope_head_dim", type=int, default=None)
+    parser.add_argument("--v_head_dim", type=int, default=None)
     args = parser.parse_args()
 
     from model import create_model
@@ -394,6 +399,16 @@ if __name__ == "__main__":
         kwargs["n_heads"] = args.n_heads
     if args.d_ff is not None:
         kwargs["d_ff"] = args.d_ff
+    if args.kv_lora_rank is not None:
+        kwargs["kv_lora_rank"] = args.kv_lora_rank
+    if args.q_lora_rank is not None:
+        kwargs["q_lora_rank"] = args.q_lora_rank
+    if args.qk_nope_head_dim is not None:
+        kwargs["qk_nope_head_dim"] = args.qk_nope_head_dim
+    if args.qk_rope_head_dim is not None:
+        kwargs["qk_rope_head_dim"] = args.qk_rope_head_dim
+    if args.v_head_dim is not None:
+        kwargs["v_head_dim"] = args.v_head_dim
 
     model = create_model(variant=args.model, **kwargs)
 

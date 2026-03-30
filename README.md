@@ -58,7 +58,7 @@ wandb login
 ## Files
 
 - `data.py` - Data loading from HuggingFace streaming dataset
-- `model.py` - Baseline and baseline+ transformer models (modify this!)
+- `model.py` - Baseline, baseline+, and MLA transformer models (modify this!)
 - `train.py` - Training loop with wandb logging
 - `eval.py` - Evaluation script with metric breakdown
 - `metric.py` - `bytes_per_token_infer` metric and `InferenceProfile`
@@ -73,6 +73,8 @@ python train.py
 # With a specific model variant
 python train.py --model baseline
 python train.py --model baseline_plus
+python train.py --model mla
+python train.py --model mla --kv_lora_rank 96 --q_lora_rank 96 --qk_rope_head_dim 48
 
 # Custom config
 python train.py --batch_size 64 --max_lr 8e-4 --num_steps 30000 --d_model 768 --n_layers 8
@@ -96,10 +98,11 @@ python eval.py --checkpoint model.pt --visualize  # + save breakdown chart
 
 ## Visualization
 
-Compare baseline vs baseline+ (or any model variants):
+Compare baseline vs baseline+ vs mla (or any model variants):
 
 ```bash
-python visualize.py                                   # compare baseline vs baseline+
+python visualize.py                                   # compare baseline vs baseline+ by default
+python visualize.py --models baseline mla             # compare selected variants
 python visualize.py --models baseline                  # single model breakdown
 python visualize.py --seq_len 1024                     # custom context length
 ```
@@ -111,18 +114,20 @@ Profile any model variant without training:
 ```bash
 python metric.py --model baseline
 python metric.py --model baseline_plus --seq_len 1024
+python metric.py --model mla --seq_len 1024
 ```
 
 ## Baselines
 
-Two model variants are provided:
+Three model variants are provided:
 
 | Variant | Description | bytes_per_token (bf16) | Key changes |
 |---|---|---|---|
 | `baseline` | Dense transformer | **194 MB** | Standard MHA, full SwiGLU FFN |
 | `baseline_plus` | GQA + top-k FFN | **153 MB** (-21%) | Fewer KV heads, activation sparsity in FFN |
+| `mla` | DeepSeek-style latent attention | Depends on MLA dims | Low-rank Q/KV compression and reduced KV cache payload |
 
-The `baseline` is your starting point. The `baseline_plus` is included purely as an example to show how architectural changes move the byte metric -- it is not something you need to use or build on. Run `python visualize.py` to see the per-component comparison.
+The `baseline` is your starting point. `baseline_plus` and `mla` are included as concrete architectural alternatives that reduce attention-related memory traffic. Run `python visualize.py` to see the per-component comparison.
 
 ## Challenge
 

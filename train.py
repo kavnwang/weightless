@@ -209,8 +209,18 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "baseline_plus"],
-                        help="Model variant: baseline (dense) or baseline_plus (GQA + top-k FFN)")
+                        choices=["baseline", "baseline_plus", "mla"],
+                        help="Model variant: baseline, baseline_plus, or mla")
+    parser.add_argument("--kv_lora_rank", type=int, default=None,
+                        help="MLA KV latent rank (d_c); only used for --model mla")
+    parser.add_argument("--q_lora_rank", type=int, default=None,
+                        help="MLA query latent rank (d'_c); only used for --model mla")
+    parser.add_argument("--qk_nope_head_dim", type=int, default=None,
+                        help="MLA non-RoPE per-head Q/K dim; only used for --model mla")
+    parser.add_argument("--qk_rope_head_dim", type=int, default=None,
+                        help="MLA RoPE per-head Q/K dim (must be even); only used for --model mla")
+    parser.add_argument("--v_head_dim", type=int, default=None,
+                        help="MLA per-head V dim; only used for --model mla")
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--wandb_entity", type=str, default="kavn",
                         help="W&B workspace/entity to log runs to")
@@ -288,6 +298,11 @@ def main():
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         d_ff=args.d_ff,
+        kv_lora_rank=args.kv_lora_rank,
+        q_lora_rank=args.q_lora_rank,
+        qk_nope_head_dim=args.qk_nope_head_dim,
+        qk_rope_head_dim=args.qk_rope_head_dim,
+        v_head_dim=args.v_head_dim,
     )
     model.to(device)
     model = torch.compile(model)
