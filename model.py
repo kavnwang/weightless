@@ -1037,6 +1037,16 @@ def create_model(variant: str = "baseline", **kwargs):
         variant: "baseline", "gqa_only", "topk_only", "baseline_plus", or "mla"
         **kwargs: passed to the model constructor
     """
+    mla_only_keys = {
+        "kv_lora_rank",
+        "q_lora_rank",
+        "qk_nope_head_dim",
+        "qk_rope_head_dim",
+        "v_head_dim",
+    }
+    if variant != "mla":
+        kwargs = {k: v for k, v in kwargs.items() if k not in mla_only_keys}
+
     if variant == "gqa_only":
         return GQAOnlyTransformer(**kwargs)
     elif variant == "topk_only":
