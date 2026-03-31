@@ -105,7 +105,7 @@ def main():
                         help="Path to model checkpoint (.pt file)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"])
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
@@ -127,10 +127,10 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=None,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12: fraction of train steps before dense -> hot/cold switch")
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn: fraction of train steps before dense -> hot/cold switch")
     parser.add_argument("--monarch_block_size", type=int, default=32)
     parser.add_argument("--memory_layers", type=int, default=12)
-    parser.add_argument("--mem_n_keys", type=int, default=384)
+    parser.add_argument("--mem_n_keys", type=int, default=256)
     parser.add_argument("--mem_heads", type=int, default=4)
     parser.add_argument("--mem_knn", type=int, default=32)
     parser.add_argument("--mem_k_dim", type=int, default=None)
@@ -143,7 +143,11 @@ def main():
     parser.add_argument("--visualize", action="store_true",
                         help="Save a breakdown chart as PNG")
     args = parser.parse_args()
-    if args.model in {"mla_hybrid_loop12", "mla_hybrid_loop12_monarch"} and args.n_layers == 8:
+    if args.model in {
+        "mla_hybrid_loop12",
+        "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+    } and args.n_layers == 8:
         # Keep CLI ergonomic: these variants are fixed to 12 layers.
         args.n_layers = 12
     if args.model == "mla_hybrid_loop12_monarch" and args.d_model == 768:
@@ -151,7 +155,15 @@ def main():
     if args.model == "mla_hybrid_loop12_monarch" and args.d_ff == 2048:
         args.d_ff = args.d_model
     if args.svd_switch_fraction is None:
-        args.svd_switch_fraction = (1.0 / 3.0) if args.model == "mla_hybrid_loop12" else 0.5
+        args.svd_switch_fraction = (
+            1.0 / 3.0
+            if args.model in {
+                "mla_hybrid_loop12",
+                "mla_hybrid_loop12_monarch",
+                "mla_hybrid_loop12_monarch_attn_svd_ffn",
+            }
+            else 0.5
+        )
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     

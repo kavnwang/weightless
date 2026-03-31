@@ -328,7 +328,7 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"],
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn"],
                         help="Model variant")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="MLA KV latent rank (d_c); used for --model mla/hotcold_mla")
@@ -347,12 +347,12 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=None,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12/mla_hybrid_loop12_monarch: fraction of total steps before switching dense -> hot/cold SVD")
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn: fraction of total steps before switching dense -> hot/cold SVD")
     parser.add_argument("--monarch_block_size", type=int, default=32,
                         help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch")
     parser.add_argument("--memory_layers", type=int, default=12,
                         help="Number of memory layers (must be 12 for mla_twostage_svd_mem12_monarch)")
-    parser.add_argument("--mem_n_keys", type=int, default=384,
+    parser.add_argument("--mem_n_keys", type=int, default=256,
                         help="Memory key table size per axis for mla_twostage_svd_mem12_monarch")
     parser.add_argument("--mem_heads", type=int, default=4,
                         help="Memory heads for mla_twostage_svd_mem12_monarch")
@@ -377,7 +377,11 @@ def main():
     parser.add_argument("--save_checkpoint", action="store_true",
                         help="Save model checkpoint at end of training")
     args = parser.parse_args()
-    if args.model in {"mla_hybrid_loop12", "mla_hybrid_loop12_monarch"} and args.n_layers == 8:
+    if args.model in {
+        "mla_hybrid_loop12",
+        "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+    } and args.n_layers == 8:
         # Keep CLI ergonomic: these variants are fixed to 12 layers.
         args.n_layers = 12
     if args.model == "mla_hybrid_loop12_monarch" and args.d_ff == 2048:
@@ -407,7 +411,11 @@ def main():
     if args.svd_switch_fraction is None:
         args.svd_switch_fraction = (
             1.0 / 3.0
-            if args.model in {"mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}
+            if args.model in {
+                "mla_hybrid_loop12",
+                "mla_hybrid_loop12_monarch",
+                "mla_hybrid_loop12_monarch_attn_svd_ffn",
+            }
             else 0.5
         )
 
@@ -502,6 +510,7 @@ def main():
             "mla_twostage_svd_mem12_monarch",
             "mla_hybrid_loop12",
             "mla_hybrid_loop12_monarch",
+            "mla_hybrid_loop12_monarch_attn_svd_ffn",
         }
         model = DDP(
             model,

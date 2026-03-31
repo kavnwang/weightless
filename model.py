@@ -3664,6 +3664,407 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
         )
 
 
+class MLAHybridLoop12MonarchAttnSVDFfnTransformer(SimpleTransformer):
+    """12-layer MLA hybrid loop with Monarch attention and switchable SVD FFNs."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 1024,
+        n_heads: int = 8,
+        n_layers: int = 12,
+        d_ff: int = 1024,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        kv_lora_rank: int | None = None,
+        q_lora_rank: int | None = None,
+        qk_nope_head_dim: int | None = None,
+        qk_rope_head_dim: int | None = None,
+        v_head_dim: int | None = None,
+        hot_token_k: int = 2000,
+        cold_latent_dim: int = 128,
+        hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
+        svd_switch_fraction: float = 1.0 / 3.0,
+        monarch_block_size: int = 32,
+        memory_layers: int | list[int] | tuple[int, ...] = 12,
+        mem_n_keys: int = 256,
+        mem_heads: int = 4,
+        mem_knn: int = 32,
+        mem_k_dim: int | None = None,
+        mem_v_dim: int | None = None,
+        mem_q_rank: int | None = None,
+        mem_share_values: bool = True,
+        qk_norm: bool = False,
+        svd_ffn_rank: int | None = None,
+        loop_block_size: int = 4,
+        loop_repeats: int = 3,
+        attn_res_block_size: int = 4,
+    ):
+        nn.Module.__init__(self)
+        if n_layers != 12:
+            raise ValueError(
+                f"mla_hybrid_loop12_monarch_attn_svd_ffn requires n_layers=12, got {n_layers}"
+            )
+        if not (0.0 <= svd_switch_fraction <= 1.0):
+            raise ValueError(f"svd_switch_fraction must be in [0, 1], got {svd_switch_fraction}")
+        if loop_block_size != 4:
+            raise ValueError(
+                f"mla_hybrid_loop12_monarch_attn_svd_ffn requires loop_block_size=4, got {loop_block_size}"
+            )
+        if loop_repeats != 3:
+            raise ValueError(
+                f"mla_hybrid_loop12_monarch_attn_svd_ffn requires loop_repeats=3, got {loop_repeats}"
+            )
+        if isinstance(memory_layers, int):
+            if memory_layers != 12:
+                raise ValueError(
+                    "mla_hybrid_loop12_monarch_attn_svd_ffn uses a fixed 12-layer schedule; "
+                    f"expected memory_layers=12, got {memory_layers}"
+                )
+        else:
+            requested = sorted(set(int(i) for i in memory_layers))
+            expected = list(range(12))
+            if requested != expected:
+                raise ValueError(
+                    "mla_hybrid_loop12_monarch_attn_svd_ffn expects memory_layers to cover all 12 indices "
+                    f"for compatibility with shared CLI args; expected {expected}, got {requested}"
+                )
+
+        head_dim = d_model // n_heads
+        default_rope_dim = max(2, (head_dim // 2) * 2)
+        self.kv_lora_rank = kv_lora_rank if kv_lora_rank is not None else max(16, d_model // 8)
+        self.q_lora_rank = q_lora_rank if q_lora_rank is not None else max(16, d_model // 8)
+        self.qk_nope_head_dim = qk_nope_head_dim if qk_nope_head_dim is not None else head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim if qk_rope_head_dim is not None else default_rope_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        if self.qk_rope_head_dim % 2 != 0:
+            raise ValueError("qk_rope_head_dim must be even")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = 1
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.weight_tied = True
+        self.hot_token_k = hot_token_k
+        self.cold_latent_dim = cold_latent_dim
+        self.hot_token_cache_path = hot_token_cache_path
+        self.svd_switch_fraction = svd_switch_fraction
+        self.monarch_block_size = monarch_block_size
+        self.mem_n_keys = mem_n_keys
+        self.mem_heads = mem_heads
+        self.mem_knn = mem_knn
+        self.mem_k_dim = mem_k_dim if mem_k_dim is not None else d_model
+        self.mem_v_dim = mem_v_dim if mem_v_dim is not None else d_model
+        self.mem_q_rank = mem_q_rank if mem_q_rank is not None else max(16, d_model // 4)
+        self.mem_share_values = mem_share_values
+        self.qk_norm = qk_norm
+        self.svd_ffn_rank = svd_ffn_rank if svd_ffn_rank is not None else 96
+        self.loop_block_size = loop_block_size
+        self.loop_repeats = loop_repeats
+        self.loop_start = self.n_layers - self.loop_block_size
+        self.attn_res_block_size = attn_res_block_size
+
+        self.bottom_even_memory_layers = [0, 2, 4, 6]
+        self.bottom_odd_svd_ffn_layers = [1, 3, 5, 7]
+        self.top_even_monarch_layers = [8, 10]
+        self.top_odd_monarch_layers = [9, 11]
+        self.svd_ffn_layers = (
+            self.bottom_odd_svd_ffn_layers
+            + self.top_even_monarch_layers
+            + self.top_odd_monarch_layers
+        )
+
+        self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+        self.register_buffer("uses_structured_svd_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+
+        hot_token_ids = _load_hot_token_ids(
+            cache_path=hot_token_cache_path,
+            vocab_size=vocab_size,
+            hot_token_k=hot_token_k,
+        )
+        self.full_token_emb = nn.Embedding(vocab_size, d_model)
+        self.token_emb = HotColdTiedEmbedding(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            hot_token_ids=hot_token_ids,
+            cold_latent_dim=cold_latent_dim,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.qk_rope_head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        mla_kwargs = {
+            "kv_lora_rank": self.kv_lora_rank,
+            "q_lora_rank": self.q_lora_rank,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+        }
+        shared_value_store = (
+            ProductKeyValueStore(self.mem_n_keys, self.mem_v_dim)
+            if self.mem_share_values else None
+        )
+        self.layers = nn.ModuleList()
+        for i in range(self.n_layers):
+            attn = MultiLatentAttentionMonarch(
+                d_model=d_model,
+                n_heads=n_heads,
+                dropout=dropout,
+                **mla_kwargs,
+                monarch_block_size=self.monarch_block_size,
+            )
+
+            memory_layer = None
+            ff = None
+            if i in self.bottom_even_memory_layers:
+                memory_layer = ProductKeyMemoryLayer(
+                    d_model=d_model,
+                    mem_n_keys=self.mem_n_keys,
+                    mem_heads=self.mem_heads,
+                    mem_knn=self.mem_knn,
+                    key_dim=self.mem_k_dim,
+                    value_dim=self.mem_v_dim,
+                    mem_q_rank=self.mem_q_rank,
+                    value_store=shared_value_store,
+                    memory_plus=False,
+                    qk_norm=self.qk_norm,
+                )
+            elif i in self.svd_ffn_layers:
+                ff = SVDSwiGLUFF(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    svd_rank=self.svd_ffn_rank,
+                )
+            else:
+                ff = SwiGLUFF(d_model=d_model, d_ff=d_ff)
+
+            self.layers.append(
+                HybridAttnResidualTransformerBlock(
+                    d_model=d_model,
+                    layer_number=i,
+                    attn=attn,
+                    ff=ff,
+                    memory_layer=memory_layer,
+                    block_size=self.attn_res_block_size,
+                )
+            )
+        self.ln_f = nn.LayerNorm(d_model)
+        self._init_weights(self.n_layers)
+
+    @property
+    def effective_layer_executions(self) -> int:
+        return self.loop_start + self.loop_block_size * self.loop_repeats
+
+    def _layer_exec_counts(self) -> list[int]:
+        return [1 if i < self.loop_start else self.loop_repeats for i in range(self.n_layers)]
+
+    def _convert_embedding_to_hotcold(self):
+        if bool(self.uses_hotcold_flag.item()):
+            return
+        with torch.no_grad():
+            full_weight = self.full_token_emb.weight.detach()
+            hot_ids = self.token_emb.hot_token_ids
+            cold_ids = self.token_emb.cold_token_ids
+            self.token_emb.hot_emb.weight.copy_(full_weight[hot_ids])
+
+            cold_full = full_weight[cold_ids].float()
+            U, S, Vh = torch.linalg.svd(cold_full, full_matrices=False)
+            rank = min(self.cold_latent_dim, S.numel())
+            U_r = U[:, :rank]
+            S_r = S[:rank]
+            Vh_r = Vh[:rank, :]
+            cold_u = U_r * S_r.unsqueeze(0)
+
+            self.token_emb.cold_emb_u.weight.zero_()
+            self.token_emb.cold_emb_u.weight[:, :rank].copy_(
+                cold_u.to(self.token_emb.cold_emb_u.weight.dtype)
+            )
+            self.token_emb.cold_latent_to_model.weight.zero_()
+            self.token_emb.cold_latent_to_model.weight[:, :rank].copy_(
+                Vh_r.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
+            )
+            self.full_token_emb.weight.requires_grad_(False)
+            self.uses_hotcold_flag.fill_(True)
+
+    def _convert_structured_layers_to_svd(self):
+        if bool(self.uses_structured_svd_flag.item()):
+            return
+        for layer in self.layers:
+            layer.convert_full_to_svd()
+        self.uses_structured_svd_flag.fill_(True)
+
+    def convert_full_to_hotcold_svd(self):
+        # One-shot phase transition: hot/cold embedding + FFN SVD factorization.
+        self._convert_embedding_to_hotcold()
+        self._convert_structured_layers_to_svd()
+
+    def forward(self, input_ids, attention_mask=None):
+        _, T = input_ids.shape
+        device = input_ids.device
+        if bool(self.uses_hotcold_flag.item()):
+            x = self.token_emb(input_ids)
+        else:
+            x = self.full_token_emb(input_ids)
+        x = self.dropout(x)
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
+
+        blocks = [x]
+        partial = x
+        exec_layer_number = 0
+        for i in range(self.loop_start):
+            blocks, partial = self.layers[i](
+                blocks,
+                partial,
+                causal_mask,
+                attention_mask,
+                self.rope,
+                positions,
+                execution_layer_number=exec_layer_number,
+            )
+            exec_layer_number += 1
+        for _ in range(self.loop_repeats):
+            for i in range(self.loop_start, self.n_layers):
+                blocks, partial = self.layers[i](
+                    blocks,
+                    partial,
+                    causal_mask,
+                    attention_mask,
+                    self.rope,
+                    positions,
+                    execution_layer_number=exec_layer_number,
+                )
+                exec_layer_number += 1
+
+        x = self.ln_f(partial)
+        if bool(self.uses_hotcold_flag.item()):
+            return self.token_emb.logits(x)
+        return F.linear(x, self.full_token_emb.weight)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        dc = self.kv_lora_rank
+        dcp = self.q_lora_rank
+        d_nope = self.qk_nope_head_dim
+        d_rope = self.qk_rope_head_dim
+        d_v = self.v_head_dim
+        exec_counts = self._layer_exec_counts()
+        exec_L = sum(exec_counts)
+        M = len(self.bottom_even_memory_layers)
+
+        if bool(self.uses_hotcold_flag.item()):
+            r = self.cold_latent_dim
+            n_hot = self.token_emb.num_hot_tokens
+            n_cold = self.token_emb.num_cold_tokens
+            lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else max(d, r + d * r) * wb
+        else:
+            lm_head_bytes = V * d * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else d * wb
+
+        attn_q_bytes = L * (d * dcp + dcp * (h * d_nope) + dcp * (h * d_rope)) * wb
+        attn_k_bytes = L * (d * dc + dc * (h * d_nope) + d * d_rope) * wb
+        attn_v_bytes = L * (dc * (h * d_v)) * wb
+
+        attn_o_numel = 0
+        ffn_numel = 0
+        for layer in self.layers:
+            attn = getattr(layer, "attn", None)
+            proj = getattr(attn, "proj", None)
+            if proj is not None:
+                attn_o_numel += sum(p.numel() for p in proj.parameters())
+            if layer.memory_layer is not None:
+                continue
+            if isinstance(layer.ff, SVDSwiGLUFF):
+                ffn_numel += layer.ff.active_weight_numel()
+            else:
+                ffn_numel += sum(p.numel() for p in layer.ff.parameters())
+        attn_o_bytes = attn_o_numel * wb
+
+        dense_memory_query_bytes = M * (
+            d * self.mem_q_rank + self.mem_q_rank * (self.mem_heads * self.mem_k_dim)
+        ) * wb
+        dense_memory_key_bytes = M * (self.mem_heads * self.mem_n_keys * self.mem_k_dim) * wb
+        dense_memory_value_bytes = M * (self.mem_heads * self.mem_knn * self.mem_v_dim) * wb
+        dense_memory_proj_bytes = M * (self.mem_v_dim * d) * wb if self.mem_v_dim != d else 0
+        ffn_bytes = (
+            ffn_numel * wb
+            + dense_memory_query_bytes
+            + dense_memory_key_bytes
+            + dense_memory_value_bytes
+            + dense_memory_proj_bytes
+        )
+
+        norm_bytes = (
+            (2 * L + 1) * 2 * d * wb
+            + (2 * L) * d * wb
+            + (2 * L) * d * wb
+        )
+        kv_cache_token_width = dc + d_rope
+        kv_cache_read_bytes = kv_cache_token_width * seq_len * exec_L * kb
+        kv_cache_write_bytes = kv_cache_token_width * exec_L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="mla_hybrid_loop12_monarch_attn_svd_ffn",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"phase={'hotcold+svd' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
+                f"mem_layers={self.bottom_even_memory_layers}; "
+                f"svd_ffn={self.svd_ffn_layers}; "
+                f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
+                f"top4_loopx{self.loop_repeats}"
+            ),
+        )
+
+
 # ============================================================================
 # Factory
 # ============================================================================
@@ -3702,13 +4103,40 @@ def create_model(variant: str = "baseline", **kwargs):
         "mem_share_values",
         "qk_norm",
     }
-    if variant not in {"mla", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
+    if variant not in {
+        "mla",
+        "hotcold_mla",
+        "mla_twostage_svd_mem12_monarch",
+        "mla_hybrid_loop12",
+        "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+    }:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_only_keys}
-    if variant not in {"hotcold_svd", "twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
+    if variant not in {
+        "hotcold_svd",
+        "twostage_svd",
+        "hotcold_mla",
+        "mla_twostage_svd_mem12_monarch",
+        "mla_hybrid_loop12",
+        "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+    }:
         kwargs = {k: v for k, v in kwargs.items() if k not in hotcold_only_keys}
-    if variant not in {"twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
+    if variant not in {
+        "twostage_svd",
+        "hotcold_mla",
+        "mla_twostage_svd_mem12_monarch",
+        "mla_hybrid_loop12",
+        "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+    }:
         kwargs = {k: v for k, v in kwargs.items() if k not in twostage_only_keys}
-    if variant not in {"mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
+    if variant not in {
+        "mla_twostage_svd_mem12_monarch",
+        "mla_hybrid_loop12",
+        "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+    }:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_mem_monarch_only_keys}
 
     if variant == "gqa_only":
@@ -3727,6 +4155,8 @@ def create_model(variant: str = "baseline", **kwargs):
         return MLAHybridLoop12Transformer(**kwargs)
     elif variant == "mla_hybrid_loop12_monarch":
         return MLAHybridLoop12MonarchTransformer(**kwargs)
+    elif variant == "mla_hybrid_loop12_monarch_attn_svd_ffn":
+        return MLAHybridLoop12MonarchAttnSVDFfnTransformer(**kwargs)
     elif variant == "hotcold_svd":
         return HotColdSVDTransformer(**kwargs)
     elif variant == "twostage_svd":
@@ -3750,6 +4180,7 @@ if __name__ == "__main__":
         "mla_twostage_svd_mem12_monarch",
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "hotcold_svd",
         "twostage_svd",
         "loop_top4x3_attnres",
