@@ -3373,6 +3373,11 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
         self.bottom_odd_monarch_ffn_layers = [1, 3, 5, 7]
         self.top_even_monarch_layers = [8, 10]
         self.top_odd_monarch_layers = [9, 11]
+        self.monarch_ffn_layers = (
+            self.bottom_odd_monarch_ffn_layers
+            + self.top_even_monarch_layers
+            + self.top_odd_monarch_layers
+        )
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -3418,7 +3423,7 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
                     memory_plus=False,
                     qk_norm=self.qk_norm,
                 )
-            elif i in self.bottom_odd_monarch_ffn_layers:
+            elif i in self.monarch_ffn_layers:
                 ff = MonarchSwiGLUFF(
                     d_model=d_model,
                     d_ff=d_ff,
@@ -3586,8 +3591,8 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
             unique_opt_state_bytes=unique_numel * 12,
             notes=(
                 f"mem_layers={self.bottom_even_memory_layers}; "
-                f"bottom_monarch_ffn={self.bottom_odd_monarch_ffn_layers}; "
-                f"top_monarch={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
+                f"monarch_ffn={self.monarch_ffn_layers}; "
+                f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
                 f"top4_loopx{self.loop_repeats}"
             ),
         )

@@ -352,7 +352,7 @@ def main():
                         help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch")
     parser.add_argument("--memory_layers", type=int, default=12,
                         help="Number of memory layers (must be 12 for mla_twostage_svd_mem12_monarch)")
-    parser.add_argument("--mem_n_keys", type=int, default=256,
+    parser.add_argument("--mem_n_keys", type=int, default=384,
                         help="Memory key table size per axis for mla_twostage_svd_mem12_monarch")
     parser.add_argument("--mem_heads", type=int, default=4,
                         help="Memory heads for mla_twostage_svd_mem12_monarch")

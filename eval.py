@@ -130,7 +130,7 @@ def main():
                         help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12: fraction of train steps before dense -> hot/cold switch")
     parser.add_argument("--monarch_block_size", type=int, default=32)
     parser.add_argument("--memory_layers", type=int, default=12)
-    parser.add_argument("--mem_n_keys", type=int, default=256)
+    parser.add_argument("--mem_n_keys", type=int, default=384)
     parser.add_argument("--mem_heads", type=int, default=4)
     parser.add_argument("--mem_knn", type=int, default=32)
     parser.add_argument("--mem_k_dim", type=int, default=None)
