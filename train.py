@@ -10,6 +10,7 @@ from tqdm import tqdm
 # Peak TFLOPS for MFU calculation (BF16 tensor core ops)
 # H100 SXM: 990 TFLOPS BF16, A100: 312 TFLOPS BF16
 GPU_PEAK_TFLOPS = 990
+DATASET_TOKENS_PER_EPOCH = 1_300_000_000
 
 from data import get_dataloader
 from model import create_model
@@ -77,10 +78,18 @@ def compute_loss(model, batch, device):
 
 
 def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float) -> float:
-    """Linear warmup then linear decay."""
-    if step < warmup_steps:
+    """Linear warmup then linear decay (hits min_lr at final scheduled step)."""
+    if total_steps <= 1:
+        return min_lr
+
+    warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+    if warmup_steps > 0 and step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
-    decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
+
+    # Ensure final scheduled step reaches min_lr exactly.
+    decay_den = max(1, total_steps - warmup_steps - 1)
+    decay_step = min(max(step - warmup_steps, 0), decay_den)
+    decay_ratio = decay_step / decay_den
     return max_lr - (max_lr - min_lr) * decay_ratio
 
 
@@ -118,6 +127,8 @@ def train(
     warmup_steps: int = 25,
     use_wandb: bool = True,
     use_ddp: bool = False,
+    first_epoch_steps: int | None = None,
+    hold_min_after_first_epoch: bool = False,
 ):
     """Main training loop with logging every eval_every steps."""
     model.train()
@@ -134,7 +145,14 @@ def train(
 
     pbar = tqdm(range(num_steps), desc="Training", disable=not is_main(use_ddp))
     for step in pbar:
-        lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
+        if hold_min_after_first_epoch and first_epoch_steps is not None:
+            schedule_steps = max(1, min(num_steps, first_epoch_steps))
+            if step >= schedule_steps:
+                lr = min_lr
+            else:
+                lr = get_lr(step, warmup_steps, schedule_steps, max_lr, min_lr)
+        else:
+            lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -203,14 +221,20 @@ def main():
     parser.add_argument("--no_pin_memory", action="store_true")
     parser.add_argument("--no_persistent_workers", action="store_true")
     parser.add_argument("--num_steps", type=int, default=None)
+    parser.add_argument(
+        "--dataset_epochs",
+        type=int,
+        default=1,
+        help="Number of dataset epochs to train in one continuous run (no LR reset)",
+    )
     parser.add_argument("--eval_every", type=int, default=None)
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"],
-                        help="Model variant: baseline, gqa_only, topk_only, baseline_plus, or mla")
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "loop_top4x3_attnres"],
+                        help="Model variant: baseline, gqa_only, topk_only, baseline_plus, mla, or loop_top4x3_attnres")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="MLA KV latent rank (d_c); only used for --model mla")
     parser.add_argument("--q_lora_rank", type=int, default=None,
@@ -230,6 +254,9 @@ def main():
     parser.add_argument("--save_checkpoint", action="store_true",
                         help="Save model checkpoint at end of training")
     args = parser.parse_args()
+    if args.dataset_epochs < 1:
+        raise ValueError(f"--dataset_epochs must be >= 1, got {args.dataset_epochs}")
+    user_set_num_steps = args.num_steps is not None
 
     # Autoscale max_lr: args.max_lr is calibrated at d_model=768
     # Wider models use lower LR (muP-style sqrt scaling)
@@ -240,20 +267,30 @@ def main():
     local_rank, world_size, use_ddp = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
     use_wandb = not args.no_wandb
+    tokens_per_step = args.batch_size * 512 * world_size
+    steps_per_epoch = (DATASET_TOKENS_PER_EPOCH + tokens_per_step - 1) // tokens_per_step
     if args.num_steps is None:
-        args.num_steps = (1_300_000_000 + (args.batch_size * 512 * world_size) - 1) // (args.batch_size * 512 * world_size)
+        total_tokens_target = DATASET_TOKENS_PER_EPOCH * args.dataset_epochs
+        args.num_steps = (total_tokens_target + tokens_per_step - 1) // tokens_per_step
     if args.eval_every is None:
-        args.eval_every = max(1, int(0.04 * args.num_steps))
+        # Keep eval cadence tied to a single epoch, even for multi-epoch continuous runs.
+        args.eval_every = max(1, int(0.04 * steps_per_epoch))
 
     if is_main(use_ddp):
         if args.d_model != 768:
             print(f"  Autoscaled max_lr from {base_lr:.2e} to {args.max_lr:.2e} (d_model={args.d_model})")
         else:
             print(f"  max_lr={args.max_lr:.2e} (d_model={args.d_model})")
+        if user_set_num_steps:
+            print(f"  dataset_epochs={args.dataset_epochs} (num_steps manually set)")
+        else:
+            print(f"  dataset_epochs={args.dataset_epochs} (steps auto-derived)")
         if use_ddp:
             print(f"  DDP: rank {local_rank}, world_size {world_size}")
         else:
             print(f"  Single-GPU mode (use torchrun for DDP)")
+        if args.dataset_epochs > 1:
+            print("  LR schedule: decay to min_lr in epoch 1, then hold min_lr for remaining epochs")
 
     # Enable flash attention and bf16 optimizations
     torch.backends.cuda.enable_flash_sdp(True)
@@ -359,6 +396,8 @@ def main():
         max_lr=args.max_lr,
         use_wandb=use_wandb,
         use_ddp=use_ddp,
+        first_epoch_steps=steps_per_epoch,
+        hold_min_after_first_epoch=args.dataset_epochs > 1,
     )
 
     # End-of-training summary

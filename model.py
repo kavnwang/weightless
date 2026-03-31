@@ -3,12 +3,13 @@
 Your goal: achieve val loss < 3.3 with the lowest bytes_per_token_infer score.
 Modify this model architecture to be as sparse/efficient as possible.
 
-Five variants are provided:
+Six variants are provided:
   - baseline:       dense transformer (the starting point)
   - gqa_only:       grouped-query attention only (dense FFN)
   - topk_only:      top-k FFN activation sparsity only (full MHA)
   - baseline_plus:  GQA + top-k FFN activation sparsity (shows clear improvement)
   - mla:            DeepSeek-style Multi-Head Latent Attention (MLA)
+  - loop_top4x3_attnres: loop top 4 layers 3x with inter-block attention residuals
 """
 
 import torch
@@ -422,6 +423,91 @@ class TopKSwiGLUFF(nn.Module):
             mask.scatter_(-1, topk_idx, 1.0)
             gate = gate * mask
         return self.w2(gate)
+
+
+# ============================================================================
+# Inter-block attention residuals (AttnRes)
+# ============================================================================
+
+def block_attn_res(
+    blocks: list[torch.Tensor],
+    partial_block: torch.Tensor,
+    proj: nn.Linear,
+    norm: nn.RMSNorm,
+) -> torch.Tensor:
+    """Inter-block attention over completed block reps + current partial block.
+
+    Args:
+        blocks: completed block representations, each [B, T, D]
+        partial_block: current in-progress block state [B, T, D]
+    """
+    v = torch.stack(blocks + [partial_block], dim=0)  # [N+1, B, T, D]
+    k = norm(v)
+    logits = torch.einsum("d,nbtd->nbt", proj.weight.squeeze(0), k)
+    h = torch.einsum("nbt,nbtd->btd", logits.softmax(0), v)
+    return h
+
+
+class AttnResidualTransformerBlock(nn.Module):
+    """Transformer block augmented with inter-block attention residuals."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: int,
+        d_ff: int,
+        dropout: float,
+        layer_number: int,
+        block_size: int = 8,
+    ):
+        super().__init__()
+        self.layer_number = layer_number
+        self.block_size = block_size
+        self.boundary_interval = max(1, block_size // 2)  # 2 sublayers per transformer layer
+
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = SwiGLUFF(d_model, d_ff)
+
+        self.attn_res_proj = nn.Linear(d_model, 1, bias=False)
+        self.attn_res_norm = nn.RMSNorm(d_model)
+        self.mlp_res_proj = nn.Linear(d_model, 1, bias=False)
+        self.mlp_res_norm = nn.RMSNorm(d_model)
+
+    def forward(
+        self,
+        blocks,
+        hidden_states,
+        causal_mask,
+        attention_mask,
+        rope,
+        positions,
+        execution_layer_number: int | None = None,
+    ):
+        partial_block = hidden_states
+        if partial_block is None:
+            partial_block = blocks[-1]
+
+        # Apply inter-block attention residual before self-attention.
+        h = block_attn_res(blocks, partial_block, self.attn_res_proj, self.attn_res_norm)
+
+        # If crossing a block boundary, close the previous partial block.
+        # blocks already includes token embedding, so skip layer 0 boundary.
+        layer_num = self.layer_number if execution_layer_number is None else execution_layer_number
+        if layer_num > 0 and (layer_num % self.boundary_interval == 0):
+            blocks.append(partial_block)
+            partial_block = None
+
+        attn_out = self.attn(self.ln1(h), causal_mask, attention_mask, rope, positions)
+        partial_block = attn_out if partial_block is None else partial_block + attn_out
+
+        # Apply inter-block attention residual before MLP.
+        h = block_attn_res(blocks, partial_block, self.mlp_res_proj, self.mlp_res_norm)
+        mlp_out = self.ff(self.ln2(h))
+        partial_block = partial_block + mlp_out
+        return blocks, partial_block
 
 
 # ============================================================================
@@ -1026,6 +1112,205 @@ class MLATransformer(SimpleTransformer):
         )
 
 
+class LoopTop4x3AttnResTransformer(SimpleTransformer):
+    """Loop top 4 layers for 3 passes + inter-block attention residuals."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        loop_block_size: int = 4,
+        loop_repeats: int = 3,
+        attn_res_block_size: int = 4,
+    ):
+        nn.Module.__init__(self)
+        if n_layers < loop_block_size:
+            raise ValueError(
+                f"loop_block_size={loop_block_size} requires n_layers >= {loop_block_size}, got {n_layers}"
+            )
+        if loop_repeats < 1:
+            raise ValueError(f"loop_repeats must be >= 1, got {loop_repeats}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = d_model // n_heads
+        self.weight_tied = True
+
+        self.loop_block_size = loop_block_size
+        self.loop_repeats = loop_repeats
+        self.loop_start = self.n_layers - self.loop_block_size
+        self.attn_res_block_size = attn_res_block_size
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.head_dim,
+            max_seq_len=max_seq_len,
+        )
+        self.layers = nn.ModuleList([
+            AttnResidualTransformerBlock(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_heads,
+                d_ff=d_ff,
+                dropout=dropout,
+                layer_number=i,
+                block_size=self.attn_res_block_size,
+            )
+            for i in range(n_layers)
+        ])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.token_emb.weight
+        self._init_weights(n_layers)
+
+    @property
+    def effective_layer_executions(self) -> int:
+        return self.loop_start + self.loop_block_size * self.loop_repeats
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        x = self.token_emb(input_ids)
+        x = self.dropout(x)
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
+        )
+
+        # Inter-block residual memory starts with token embedding representation.
+        blocks = [x]
+        partial = x
+        exec_layer_number = 0
+
+        # Prefix layers run once.
+        for i in range(self.loop_start):
+            blocks, partial = self.layers[i](
+                blocks,
+                partial,
+                causal_mask,
+                attention_mask,
+                self.rope,
+                positions,
+                execution_layer_number=exec_layer_number,
+            )
+            exec_layer_number += 1
+
+        # Reuse top block for multiple passes.
+        for _ in range(self.loop_repeats):
+            for i in range(self.loop_start, self.n_layers):
+                blocks, partial = self.layers[i](
+                    blocks,
+                    partial,
+                    causal_mask,
+                    attention_mask,
+                    self.rope,
+                    positions,
+                    execution_layer_number=exec_layer_number,
+                )
+                exec_layer_number += 1
+
+        x = self.ln_f(partial)
+        logits = self.head(x)
+        return logits
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        """Compute bytes_per_token_infer for looped + AttnRes variant."""
+        d = self.d_model
+        h = self.n_heads
+        kv_h = self.n_kv_heads
+        hd = self.head_dim
+        physical_L = self.n_layers
+        exec_L = self.effective_layer_executions
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+
+        lm_head_bytes = V * d * wb
+        if self.weight_tied and not count_reuse:
+            embedding_bytes = 0
+        else:
+            embedding_bytes = d * wb
+
+        # Projections are read each execution pass.
+        attn_q_bytes = exec_L * d * (h * hd) * wb
+        attn_k_bytes = exec_L * d * (kv_h * hd) * wb
+        attn_v_bytes = exec_L * d * (kv_h * hd) * wb
+        attn_o_bytes = exec_L * (h * hd) * d * wb
+        ffn_bytes = exec_L * (
+            d * self.d_ff
+            + self.d_ff * d
+            + d * self.d_ff
+        ) * wb
+
+        # LayerNorm/LN + AttnRes RMSNorm + AttnRes projections.
+        norm_bytes = (
+            (2 * exec_L + 1) * 2 * d * wb      # ln1, ln2, ln_f
+            + (2 * exec_L) * d * wb            # attn_res_norm + mlp_res_norm (RMSNorm weights)
+            + (2 * exec_L) * d * wb            # attn_res_proj + mlp_res_proj (1xd each)
+        )
+
+        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * exec_L * kb
+        kv_cache_write_bytes = 2 * kv_h * hd * exec_L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="loop_top4x3_attnres",
+            d_model=d,
+            n_layers=physical_L,
+            n_heads=h,
+            n_kv_heads=kv_h,
+            head_dim=hd,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"Top {self.loop_block_size} layers looped x{self.loop_repeats}; "
+                f"AttnRes block_size={self.attn_res_block_size}"
+            ),
+        )
+
+
 # ============================================================================
 # Factory
 # ============================================================================
@@ -1034,7 +1319,7 @@ def create_model(variant: str = "baseline", **kwargs):
     """Factory function to create a model.
 
     Args:
-        variant: "baseline", "gqa_only", "topk_only", "baseline_plus", or "mla"
+        variant: "baseline", "gqa_only", "topk_only", "baseline_plus", "mla", or "loop_top4x3_attnres"
         **kwargs: passed to the model constructor
     """
     mla_only_keys = {
@@ -1055,6 +1340,8 @@ def create_model(variant: str = "baseline", **kwargs):
         return BaselinePlusTransformer(**kwargs)
     elif variant == "mla":
         return MLATransformer(**kwargs)
+    elif variant == "loop_top4x3_attnres":
+        return LoopTop4x3AttnResTransformer(**kwargs)
     else:
         return SimpleTransformer(**kwargs)
 
@@ -1062,7 +1349,7 @@ def create_model(variant: str = "baseline", **kwargs):
 if __name__ == "__main__":
     from metric import print_profile
 
-    for variant in ["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"]:
+    for variant in ["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "loop_top4x3_attnres"]:
         print(f"\n{'='*60}")
         print(f"  {variant}")
         print(f"{'='*60}")
