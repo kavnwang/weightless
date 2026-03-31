@@ -105,7 +105,7 @@ def main():
                         help="Path to model checkpoint (.pt file)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn"])
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "mla_twostage_svd_mem12_binarydp", "dp_shared_memory", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
@@ -127,7 +127,7 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=None,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn: fraction of train steps before dense -> hot/cold switch")
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn: fraction of train steps before dense -> hot/cold switch")
     parser.add_argument("--monarch_block_size", type=int, default=32)
     parser.add_argument("--memory_layers", type=int, default=12)
     parser.add_argument("--mem_n_keys", type=int, default=256)

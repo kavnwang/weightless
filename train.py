@@ -328,7 +328,7 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn"],
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "mla_twostage_svd_mem12_binarydp", "dp_shared_memory", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn"],
                         help="Model variant")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="MLA KV latent rank (d_c); used for --model mla/hotcold_mla")
@@ -347,23 +347,23 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=None,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn: fraction of total steps before switching dense -> hot/cold SVD")
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn: fraction of total steps before switching dense -> hot/cold SVD")
     parser.add_argument("--monarch_block_size", type=int, default=32,
-                        help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch")
+                        help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--memory_layers", type=int, default=12,
-                        help="Number of memory layers (must be 12 for mla_twostage_svd_mem12_monarch)")
+                        help="Number of memory layers (must be 12 for mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp)")
     parser.add_argument("--mem_n_keys", type=int, default=256,
-                        help="Memory key table size per axis for mla_twostage_svd_mem12_monarch")
+                        help="Memory key table size per axis for mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--mem_heads", type=int, default=4,
-                        help="Memory heads for mla_twostage_svd_mem12_monarch")
+                        help="Memory heads for mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--mem_knn", type=int, default=32,
-                        help="Memory k-NN lookup count for mla_twostage_svd_mem12_monarch")
+                        help="Memory k-NN lookup count for mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--mem_k_dim", type=int, default=None,
-                        help="Memory key dimension for mla_twostage_svd_mem12_monarch")
+                        help="Memory key dimension for mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--mem_v_dim", type=int, default=None,
-                        help="Memory value dimension for mla_twostage_svd_mem12_monarch")
+                        help="Memory value dimension for mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--mem_q_rank", type=int, default=None,
-                        help="Low-rank query latent dim for memory lookups in mla_twostage_svd_mem12_monarch")
+                        help="Low-rank query latent dim for memory lookups in mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--no_mem_share_values", action="store_true",
                         help="Disable shared value table across memory layers")
     parser.add_argument("--qk_norm", action="store_true",
@@ -508,6 +508,7 @@ def main():
             "twostage_svd",
             "hotcold_mla",
             "mla_twostage_svd_mem12_monarch",
+            "mla_twostage_svd_mem12_binarydp",
             "mla_hybrid_loop12",
             "mla_hybrid_loop12_monarch",
             "mla_hybrid_loop12_monarch_attn_svd_ffn",

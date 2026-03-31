@@ -9,6 +9,8 @@ Six variants are provided:
   - topk_only:      top-k FFN activation sparsity only (full MHA)
   - baseline_plus:  GQA + top-k FFN activation sparsity (shows clear improvement)
   - mla:            DeepSeek-style Multi-Head Latent Attention (MLA)
+  - mla_twostage_svd_mem12_binarydp: 12-layer MLA + binary-DP memory retrieval
+  - dp_shared_memory: standard attention + binary-DP shared memory layers
   - loop_top4x3_attnres: loop top 4 layers 3x with inter-block attention residuals
   - mla_hybrid_loop12: 12-layer MLA hybrid with memory/SVD/Monarch + top4 looping
 """
@@ -1303,6 +1305,180 @@ class ProductKeyMemoryLayer(nn.Module):
         scores, best = torch.topk(all_scores, k=knn, dim=-1, largest=True, sorted=True)
         indices = all_indices.gather(-1, best)
         return scores.reshape(bs * self.mem_heads, knn), indices.reshape(bs * self.mem_heads, knn)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, _ = x.shape
+        x_flat = x.reshape(b * t, self.d_model)
+        query_latent = self.query_down(x_flat)
+        query = self.query_up(query_latent).view(b * t, self.mem_heads, self.key_dim)
+        scores, indices = self.get_indices(
+            query.reshape(b * t * self.mem_heads, self.key_dim),
+            self.mem_knn,
+        )
+        scores = F.softmax(scores.float(), dim=-1).to(self.value_store.weight.dtype)
+        indices = indices.view(b * t, self.mem_heads * self.mem_knn)
+        scores = scores.view(b * t, self.mem_heads * self.mem_knn)
+        y = F.embedding_bag(
+            indices,
+            self.value_store.weight,
+            per_sample_weights=scores,
+            mode="sum",
+        )
+        if self.memory_plus:
+            y = self.value_proj(y * F.silu(self.swilu_projection(x_flat)))
+        elif self.value_proj is not None:
+            y = self.value_proj(y)
+        return y.view(b, t, -1)
+
+
+class BinaryCodeValueStore(nn.Module):
+    """Trainable value table indexed by binary product codes."""
+
+    def __init__(self, total_keys: int, value_dim: int):
+        super().__init__()
+        if total_keys < 2:
+            raise ValueError(f"total_keys must be >= 2, got {total_keys}")
+        self.total_keys = total_keys
+        self.value_dim = value_dim
+        self.values = nn.Embedding(total_keys, value_dim)
+        self.reset_parameters()
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.values.weight
+
+    def reset_parameters(self):
+        nn.init.normal_(self.values.weight, mean=0.0, std=self.value_dim ** -0.5)
+
+
+class BinaryProductCodeMemoryLayer(nn.Module):
+    """m-way binary product-code memory with exact top-k DP retrieval."""
+
+    def __init__(
+        self,
+        d_model: int,
+        mem_n_keys: int,
+        mem_heads: int,
+        mem_knn: int,
+        key_dim: int,
+        value_dim: int = -1,
+        mem_q_rank: int | None = None,
+        value_store: BinaryCodeValueStore | None = None,
+        memory_plus: bool = False,
+        query_bias: bool = True,
+        qk_norm: bool = False,
+    ):
+        super().__init__()
+        if mem_heads < 1:
+            raise ValueError(f"mem_heads must be >= 1, got {mem_heads}")
+        if mem_n_keys < 2:
+            raise ValueError(f"mem_n_keys must be >= 2, got {mem_n_keys}")
+        self.d_model = d_model
+        self.mem_n_keys = mem_n_keys
+        self.mem_heads = mem_heads
+        self.key_dim = key_dim
+        self.value_dim = d_model if value_dim < 0 else value_dim
+        self.mem_q_rank = mem_q_rank if mem_q_rank is not None else key_dim
+        if self.mem_q_rank < 1:
+            raise ValueError(f"mem_q_rank must be >= 1, got {self.mem_q_rank}")
+        self.memory_plus = memory_plus
+        self.qk_norm = qk_norm
+
+        self.total_keys = mem_n_keys * mem_n_keys
+        self.num_buckets = int(math.log2(self.total_keys))
+        if (1 << self.num_buckets) != self.total_keys:
+            raise ValueError(
+                "Binary product-code memory requires mem_n_keys^2 to be a power of 2; "
+                f"got mem_n_keys={mem_n_keys} => total_keys={self.total_keys}"
+            )
+        if self.key_dim % self.num_buckets != 0:
+            raise ValueError(
+                "Binary product-code memory requires key_dim divisible by num_buckets; "
+                f"got key_dim={self.key_dim}, num_buckets={self.num_buckets}"
+            )
+        self.bucket_dim = self.key_dim // self.num_buckets
+        self.mem_knn = min(mem_knn, self.total_keys)
+
+        # [heads, buckets, 2, bucket_dim]
+        self.keys = nn.Parameter(torch.empty(mem_heads, self.num_buckets, 2, self.bucket_dim))
+        self.value_store = (
+            value_store if value_store is not None
+            else BinaryCodeValueStore(self.total_keys, self.value_dim)
+        )
+        self.query_down = nn.Linear(d_model, self.mem_q_rank, bias=query_bias)
+        self.query_up = nn.Linear(self.mem_q_rank, mem_heads * key_dim, bias=False)
+
+        if memory_plus:
+            self.swilu_projection = nn.Linear(d_model, self.value_dim, bias=False)
+            self.value_proj = nn.Linear(self.value_dim, d_model, bias=False)
+        elif self.value_dim != d_model:
+            self.swilu_projection = None
+            self.value_proj = nn.Linear(self.value_dim, d_model, bias=False)
+        else:
+            self.swilu_projection = None
+            self.value_proj = None
+
+        self.reset_binary_key_parameters(reset_values=value_store is None)
+
+    def reset_binary_key_parameters(self, reset_values: bool = False):
+        bound = 1.0 / math.sqrt(self.bucket_dim)
+        nn.init.uniform_(self.keys, -bound, bound)
+        nn.init.xavier_uniform_(self.query_down.weight)
+        if self.query_down.bias is not None:
+            nn.init.zeros_(self.query_down.bias)
+        nn.init.xavier_uniform_(self.query_up.weight)
+        if self.value_proj is not None:
+            nn.init.normal_(self.value_proj.weight, mean=0.0, std=self.d_model ** -0.5)
+        if self.swilu_projection is not None:
+            nn.init.normal_(self.swilu_projection.weight, mean=0.0, std=self.d_model ** -0.5)
+        if reset_values:
+            self.value_store.reset_parameters()
+
+    def get_indices(self, query: torch.Tensor, knn: int) -> tuple[torch.Tensor, torch.Tensor]:
+        assert query.dim() == 2 and query.size(1) == self.key_dim
+        bs = query.size(0) // self.mem_heads
+        query = query.view(bs, self.mem_heads, self.num_buckets, self.bucket_dim)
+        keys = self.keys
+        if self.qk_norm:
+            query = _rms_norm(query)
+            keys = _rms_norm(keys)
+
+        local_scores = torch.einsum("bhmd,hmcd->bhmc", query.float(), keys.float())
+        score0 = local_scores[..., 0]
+        score1 = local_scores[..., 1]
+        best_bits = score1 > score0
+        best_scores = torch.maximum(score0, score1).sum(dim=-1)
+        deltas = (score0 - score1).abs()
+
+        bit_weights = (1 << torch.arange(self.num_buckets, device=query.device, dtype=torch.int64))
+        best_codes = (best_bits.to(torch.int64) * bit_weights.view(1, 1, -1)).sum(dim=-1)
+
+        rows = bs * self.mem_heads
+        deltas = deltas.reshape(rows, self.num_buckets)
+        best_scores = best_scores.reshape(rows, 1)
+        best_codes = best_codes.reshape(rows, 1)
+        knn_eff = min(knn, 1 << self.num_buckets)
+
+        frontier_penalties = torch.zeros(rows, 1, device=query.device, dtype=torch.float32)
+        frontier_masks = torch.zeros(rows, 1, device=query.device, dtype=torch.int64)
+        for t in range(self.num_buckets):
+            shifted_penalties = frontier_penalties + deltas[:, t:t + 1]
+            shifted_masks = frontier_masks ^ bit_weights[t]
+            candidate_penalties = torch.cat([frontier_penalties, shifted_penalties], dim=1)
+            candidate_masks = torch.cat([frontier_masks, shifted_masks], dim=1)
+            step_k = min(knn_eff, candidate_penalties.size(1))
+            frontier_penalties, keep_idx = torch.topk(
+                candidate_penalties,
+                k=step_k,
+                dim=1,
+                largest=False,
+                sorted=True,
+            )
+            frontier_masks = candidate_masks.gather(1, keep_idx)
+
+        scores = best_scores - frontier_penalties
+        indices = best_codes ^ frontier_masks
+        return scores, indices
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, t, _ = x.shape
@@ -2655,6 +2831,549 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
             notes=(
                 f"phase={'hotcold' if bool(self.uses_hotcold_flag.item()) else 'dense'}; "
                 f"mem_layers={self.memory_layer_indices}; monarch_bs={self.monarch_block_size}; "
+                f"mem_q_rank={self.mem_q_rank}"
+            ),
+        )
+
+
+class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
+    """MLA + dense->hot/cold SVD + 12 binary-DP memory layers + Monarch O-proj."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 12,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        kv_lora_rank: int | None = None,
+        q_lora_rank: int | None = None,
+        qk_nope_head_dim: int | None = None,
+        qk_rope_head_dim: int | None = None,
+        v_head_dim: int | None = None,
+        hot_token_k: int = 2000,
+        cold_latent_dim: int = 128,
+        hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
+        svd_switch_fraction: float = 0.5,
+        monarch_block_size: int = 32,
+        memory_layers: int | list[int] | tuple[int, ...] = 12,
+        mem_n_keys: int = 256,
+        mem_heads: int = 4,
+        mem_knn: int = 32,
+        mem_k_dim: int | None = None,
+        mem_v_dim: int | None = None,
+        mem_q_rank: int | None = None,
+        mem_share_values: bool = True,
+        qk_norm: bool = False,
+    ):
+        nn.Module.__init__(self)
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        head_dim = d_model // n_heads
+        default_rope_dim = max(2, (head_dim // 2) * 2)
+
+        self.kv_lora_rank = kv_lora_rank if kv_lora_rank is not None else max(16, d_model // 8)
+        self.q_lora_rank = q_lora_rank if q_lora_rank is not None else max(16, d_model // 8)
+        self.qk_nope_head_dim = qk_nope_head_dim if qk_nope_head_dim is not None else head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim if qk_rope_head_dim is not None else default_rope_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even"
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = 1
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.weight_tied = True
+
+        self.hot_token_k = hot_token_k
+        self.cold_latent_dim = cold_latent_dim
+        self.hot_token_cache_path = hot_token_cache_path
+        if not (0.0 <= svd_switch_fraction <= 1.0):
+            raise ValueError(f"svd_switch_fraction must be in [0, 1], got {svd_switch_fraction}")
+        self.svd_switch_fraction = svd_switch_fraction
+        self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+
+        self.monarch_block_size = monarch_block_size
+        self.mem_n_keys = mem_n_keys
+        self.mem_heads = mem_heads
+        self.mem_knn = mem_knn
+        self.mem_k_dim = mem_k_dim if mem_k_dim is not None else d_model
+        self.mem_v_dim = mem_v_dim if mem_v_dim is not None else d_model
+        self.mem_q_rank = mem_q_rank if mem_q_rank is not None else max(16, d_model // 4)
+        self.mem_share_values = mem_share_values
+        self.qk_norm = qk_norm
+        self.mem_binary_total_keys = self.mem_n_keys * self.mem_n_keys
+        self.mem_binary_buckets = int(math.log2(self.mem_binary_total_keys))
+        if (1 << self.mem_binary_buckets) != self.mem_binary_total_keys:
+            raise ValueError(
+                "Binary memory requires mem_n_keys^2 to be power-of-two. "
+                f"Got mem_n_keys={self.mem_n_keys} => total_keys={self.mem_binary_total_keys}."
+            )
+        if self.mem_k_dim % self.mem_binary_buckets != 0:
+            raise ValueError(
+                f"mem_k_dim must be divisible by num_binary_buckets={self.mem_binary_buckets}; "
+                f"got mem_k_dim={self.mem_k_dim}."
+            )
+        if self.n_layers != 12:
+            raise ValueError(f"This architecture is fixed to n_layers=12, got {self.n_layers}")
+        if isinstance(memory_layers, int):
+            if memory_layers != 12:
+                raise ValueError(
+                    f"This architecture requires all 12 layers to be memory layers, got memory_layers={memory_layers}"
+                )
+        else:
+            requested = sorted(set(int(i) for i in memory_layers))
+            expected = list(range(self.n_layers))
+            if requested != expected:
+                raise ValueError(
+                    "This architecture requires all layers to be memory layers; "
+                    f"expected {expected}, got {requested}"
+                )
+        self.memory_layer_indices = list(range(self.n_layers))
+        if len(self.memory_layer_indices) != 12:
+            raise ValueError(
+                f"This architecture requires exactly 12 memory layers, got {len(self.memory_layer_indices)}"
+            )
+
+        hot_token_ids = _load_hot_token_ids(
+            cache_path=hot_token_cache_path,
+            vocab_size=vocab_size,
+            hot_token_k=hot_token_k,
+        )
+        self.full_token_emb = nn.Embedding(vocab_size, d_model)
+        self.token_emb = HotColdTiedEmbedding(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            hot_token_ids=hot_token_ids,
+            cold_latent_dim=cold_latent_dim,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.qk_rope_head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        mla_kwargs = {
+            "kv_lora_rank": self.kv_lora_rank,
+            "q_lora_rank": self.q_lora_rank,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+        }
+        self.shared_value_store = (
+            BinaryCodeValueStore(self.mem_binary_total_keys, self.mem_v_dim)
+            if self.mem_share_values else None
+        )
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            memory_layer = None
+            if i in self.memory_layer_indices:
+                memory_layer = BinaryProductCodeMemoryLayer(
+                    d_model=d_model,
+                    mem_n_keys=self.mem_n_keys,
+                    mem_heads=self.mem_heads,
+                    mem_knn=self.mem_knn,
+                    key_dim=self.mem_k_dim,
+                    value_dim=self.mem_v_dim,
+                    mem_q_rank=self.mem_q_rank,
+                    value_store=self.shared_value_store,
+                    memory_plus=False,
+                    qk_norm=self.qk_norm,
+                )
+            self.layers.append(
+                TransformerBlock(
+                    d_model,
+                    n_heads,
+                    n_heads,
+                    d_ff,
+                    dropout,
+                    attention_type="mla_monarch",
+                    mla_kwargs=mla_kwargs,
+                    monarch_kwargs={"monarch_block_size": self.monarch_block_size},
+                    memory_layer=memory_layer,
+                )
+            )
+        self.ln_f = nn.LayerNorm(d_model)
+        self._init_weights(n_layers)
+
+    def convert_full_to_hotcold_svd(self):
+        if bool(self.uses_hotcold_flag.item()):
+            return
+        with torch.no_grad():
+            full_weight = self.full_token_emb.weight.detach()
+            hot_ids = self.token_emb.hot_token_ids
+            cold_ids = self.token_emb.cold_token_ids
+            self.token_emb.hot_emb.weight.copy_(full_weight[hot_ids])
+
+            cold_full = full_weight[cold_ids].float()
+            U, S, Vh = torch.linalg.svd(cold_full, full_matrices=False)
+            rank = min(self.cold_latent_dim, S.numel())
+            U_r = U[:, :rank]
+            S_r = S[:rank]
+            Vh_r = Vh[:rank, :]
+            cold_u = U_r * S_r.unsqueeze(0)
+
+            self.token_emb.cold_emb_u.weight.zero_()
+            self.token_emb.cold_emb_u.weight[:, :rank].copy_(
+                cold_u.to(self.token_emb.cold_emb_u.weight.dtype)
+            )
+            self.token_emb.cold_latent_to_model.weight.zero_()
+            self.token_emb.cold_latent_to_model.weight[:, :rank].copy_(
+                Vh_r.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
+            )
+            self.full_token_emb.weight.requires_grad_(False)
+            self.uses_hotcold_flag.fill_(True)
+
+    def token_partition_masks(self, token_ids: torch.Tensor):
+        hot_mask = self.token_emb.token_is_hot(token_ids)
+        cold_mask = ~hot_mask
+        return hot_mask, cold_mask
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+        if bool(self.uses_hotcold_flag.item()):
+            x = self.token_emb(input_ids)
+        else:
+            x = self.full_token_emb(input_ids)
+        x = self.dropout(x)
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
+        for layer in self.layers:
+            x = layer(x, causal_mask, attention_mask, self.rope, positions)
+        x = self.ln_f(x)
+        if bool(self.uses_hotcold_flag.item()):
+            return self.token_emb.logits(x)
+        return F.linear(x, self.full_token_emb.weight)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        dc = self.kv_lora_rank
+        dcp = self.q_lora_rank
+        d_nope = self.qk_nope_head_dim
+        d_rope = self.qk_rope_head_dim
+        d_v = self.v_head_dim
+        M = len(self.memory_layer_indices)
+        dense_L = L - M
+
+        if bool(self.uses_hotcold_flag.item()):
+            r = self.cold_latent_dim
+            n_hot = self.token_emb.num_hot_tokens
+            n_cold = self.token_emb.num_cold_tokens
+            lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else max(d, r + d * r) * wb
+        else:
+            lm_head_bytes = V * d * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else d * wb
+
+        attn_q_bytes = L * (d * dcp + dcp * (h * d_nope) + dcp * (h * d_rope)) * wb
+        attn_k_bytes = L * (d * dc + dc * (h * d_nope) + d * d_rope) * wb
+        attn_v_bytes = L * (dc * (h * d_v)) * wb
+
+        monarch_proj_numel = 0
+        for layer in self.layers:
+            attn = getattr(layer, "attn", None)
+            proj = getattr(attn, "proj", None)
+            if proj is not None:
+                monarch_proj_numel += sum(p.numel() for p in proj.parameters())
+        attn_o_bytes = monarch_proj_numel * wb
+
+        dense_ffn_bytes = dense_L * (d * self.d_ff + self.d_ff * d + d * self.d_ff) * wb
+        memory_query_bytes = M * (
+            d * self.mem_q_rank + self.mem_q_rank * (self.mem_heads * self.mem_k_dim)
+        ) * wb
+        # Binary buckets store exactly two choices per factor.
+        memory_key_bytes = M * (self.mem_heads * 2 * self.mem_k_dim) * wb
+        memory_value_bytes = M * (self.mem_heads * self.mem_knn * self.mem_v_dim) * wb
+        memory_proj_bytes = M * (self.mem_v_dim * d) * wb if self.mem_v_dim != d else 0
+        ffn_bytes = (
+            dense_ffn_bytes
+            + memory_query_bytes
+            + memory_key_bytes
+            + memory_value_bytes
+            + memory_proj_bytes
+        )
+
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+        kv_cache_token_width = dc + d_rope
+        kv_cache_read_bytes = kv_cache_token_width * seq_len * L * kb
+        kv_cache_write_bytes = kv_cache_token_width * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="mla_twostage_svd_mem12_binarydp",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"phase={'hotcold' if bool(self.uses_hotcold_flag.item()) else 'dense'}; "
+                f"mem_layers={self.memory_layer_indices}; monarch_bs={self.monarch_block_size}; "
+                f"binary_total_keys={self.mem_binary_total_keys}; binary_buckets={self.mem_binary_buckets}; "
+                f"mem_q_rank={self.mem_q_rank}"
+            ),
+        )
+
+
+class DPSharedMemoryTransformer(SimpleTransformer):
+    """Standard MHA transformer with binary-DP memory layers and shared values."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 12,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        monarch_block_size: int = 32,  # kept for CLI compatibility; unused
+        memory_layers: int | list[int] | tuple[int, ...] = 12,
+        mem_n_keys: int = 256,
+        mem_heads: int = 4,
+        mem_knn: int = 32,
+        mem_k_dim: int | None = None,
+        mem_v_dim: int | None = None,
+        mem_q_rank: int | None = None,
+        mem_share_values: bool = True,
+        qk_norm: bool = False,
+    ):
+        nn.Module.__init__(self)
+        if d_model % n_heads != 0:
+            raise ValueError(f"d_model must be divisible by n_heads, got {d_model} and {n_heads}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = d_model // n_heads
+        self.weight_tied = True
+
+        self.monarch_block_size = monarch_block_size
+        self.mem_n_keys = mem_n_keys
+        self.mem_heads = mem_heads
+        self.mem_knn = mem_knn
+        self.mem_k_dim = mem_k_dim if mem_k_dim is not None else d_model
+        self.mem_v_dim = mem_v_dim if mem_v_dim is not None else d_model
+        self.mem_q_rank = mem_q_rank if mem_q_rank is not None else max(16, d_model // 4)
+        self.mem_share_values = mem_share_values
+        self.qk_norm = qk_norm
+        self.mem_binary_total_keys = self.mem_n_keys * self.mem_n_keys
+        self.mem_binary_buckets = int(math.log2(self.mem_binary_total_keys))
+        if (1 << self.mem_binary_buckets) != self.mem_binary_total_keys:
+            raise ValueError(
+                "Binary memory requires mem_n_keys^2 to be power-of-two. "
+                f"Got mem_n_keys={self.mem_n_keys} => total_keys={self.mem_binary_total_keys}."
+            )
+        if self.mem_k_dim % self.mem_binary_buckets != 0:
+            raise ValueError(
+                f"mem_k_dim must be divisible by num_binary_buckets={self.mem_binary_buckets}; "
+                f"got mem_k_dim={self.mem_k_dim}."
+            )
+
+        if isinstance(memory_layers, int):
+            if memory_layers < 1 or memory_layers > self.n_layers:
+                raise ValueError(
+                    f"memory_layers as int must be in [1, n_layers], got {memory_layers} with n_layers={self.n_layers}"
+                )
+            self.memory_layer_indices = list(range(self.n_layers - memory_layers, self.n_layers))
+        else:
+            requested = sorted(set(int(i) for i in memory_layers))
+            if not requested:
+                raise ValueError("memory_layers list cannot be empty")
+            if requested[0] < 0 or requested[-1] >= self.n_layers:
+                raise ValueError(
+                    f"memory_layers indices must be within [0, {self.n_layers - 1}], got {requested}"
+                )
+            self.memory_layer_indices = requested
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.head_dim,
+            max_seq_len=max_seq_len,
+        )
+        self.shared_value_store = (
+            BinaryCodeValueStore(self.mem_binary_total_keys, self.mem_v_dim)
+            if self.mem_share_values else None
+        )
+        self.layers = nn.ModuleList()
+        for i in range(n_layers):
+            memory_layer = None
+            if i in self.memory_layer_indices:
+                memory_layer = BinaryProductCodeMemoryLayer(
+                    d_model=d_model,
+                    mem_n_keys=self.mem_n_keys,
+                    mem_heads=self.mem_heads,
+                    mem_knn=self.mem_knn,
+                    key_dim=self.mem_k_dim,
+                    value_dim=self.mem_v_dim,
+                    mem_q_rank=self.mem_q_rank,
+                    value_store=self.shared_value_store,
+                    memory_plus=False,
+                    qk_norm=self.qk_norm,
+                )
+            self.layers.append(
+                TransformerBlock(
+                    d_model,
+                    n_heads,
+                    n_heads,
+                    d_ff,
+                    dropout,
+                    memory_layer=memory_layer,
+                )
+            )
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.token_emb.weight
+        self._init_weights(n_layers)
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        x = self.token_emb(input_ids)
+        x = self.dropout(x)
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
+        for layer in self.layers:
+            x = layer(x, causal_mask, attention_mask, self.rope, positions)
+        x = self.ln_f(x)
+        return self.head(x)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        kv_h = self.n_kv_heads
+        hd = self.head_dim
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        M = len(self.memory_layer_indices)
+        dense_L = L - M
+
+        lm_head_bytes = V * d * wb
+        if self.weight_tied and not count_reuse:
+            embedding_bytes = 0
+        else:
+            embedding_bytes = d * wb
+
+        attn_q_bytes = L * d * (h * hd) * wb
+        attn_k_bytes = L * d * (kv_h * hd) * wb
+        attn_v_bytes = L * d * (kv_h * hd) * wb
+        attn_o_bytes = L * (h * hd) * d * wb
+
+        dense_ffn_bytes = dense_L * (d * self.d_ff + self.d_ff * d + d * self.d_ff) * wb
+        memory_query_bytes = M * (
+            d * self.mem_q_rank + self.mem_q_rank * (self.mem_heads * self.mem_k_dim)
+        ) * wb
+        memory_key_bytes = M * (self.mem_heads * 2 * self.mem_k_dim) * wb
+        memory_value_bytes = M * (self.mem_heads * self.mem_knn * self.mem_v_dim) * wb
+        memory_proj_bytes = M * (self.mem_v_dim * d) * wb if self.mem_v_dim != d else 0
+        ffn_bytes = (
+            dense_ffn_bytes
+            + memory_query_bytes
+            + memory_key_bytes
+            + memory_value_bytes
+            + memory_proj_bytes
+        )
+
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
+        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="dp_shared_memory",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=kv_h,
+            head_dim=hd,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"mem_layers={self.memory_layer_indices}; "
+                f"binary_total_keys={self.mem_binary_total_keys}; "
+                f"binary_buckets={self.mem_binary_buckets}; "
+                f"shared_values={self.mem_share_values}; "
                 f"mem_q_rank={self.mem_q_rank}"
             ),
         )
@@ -4107,6 +4826,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla",
         "hotcold_mla",
         "mla_twostage_svd_mem12_monarch",
+        "mla_twostage_svd_mem12_binarydp",
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
@@ -4117,6 +4837,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "twostage_svd",
         "hotcold_mla",
         "mla_twostage_svd_mem12_monarch",
+        "mla_twostage_svd_mem12_binarydp",
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
@@ -4126,6 +4847,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "twostage_svd",
         "hotcold_mla",
         "mla_twostage_svd_mem12_monarch",
+        "mla_twostage_svd_mem12_binarydp",
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
@@ -4133,6 +4855,8 @@ def create_model(variant: str = "baseline", **kwargs):
         kwargs = {k: v for k, v in kwargs.items() if k not in twostage_only_keys}
     if variant not in {
         "mla_twostage_svd_mem12_monarch",
+        "mla_twostage_svd_mem12_binarydp",
+        "dp_shared_memory",
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
@@ -4151,6 +4875,10 @@ def create_model(variant: str = "baseline", **kwargs):
         return HotColdMLATransformer(**kwargs)
     elif variant == "mla_twostage_svd_mem12_monarch":
         return MLATwoStageSVDMemoryMonarchTransformer(**kwargs)
+    elif variant == "mla_twostage_svd_mem12_binarydp":
+        return MLATwoStageSVDBinaryMemoryMonarchTransformer(**kwargs)
+    elif variant == "dp_shared_memory":
+        return DPSharedMemoryTransformer(**kwargs)
     elif variant == "mla_hybrid_loop12":
         return MLAHybridLoop12Transformer(**kwargs)
     elif variant == "mla_hybrid_loop12_monarch":
@@ -4178,6 +4906,8 @@ if __name__ == "__main__":
         "mla",
         "hotcold_mla",
         "mla_twostage_svd_mem12_monarch",
+        "mla_twostage_svd_mem12_binarydp",
+        "dp_shared_memory",
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",

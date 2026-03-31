@@ -79,6 +79,8 @@ python train.py --model mla
 python train.py --model mla --kv_lora_rank 96 --q_lora_rank 96 --qk_rope_head_dim 48
 python train.py --model hotcold_mla --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt --svd_switch_fraction 0.5
 python train.py --model mla_twostage_svd_mem12_monarch --n_layers 12 --memory_layers 12 --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt --svd_switch_fraction 0.5
+python train.py --model mla_twostage_svd_mem12_binarydp --n_layers 12 --memory_layers 12 --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt --svd_switch_fraction 0.5
+python train.py --model dp_shared_memory --n_layers 12 --memory_layers 12
 python build_hot_token_cache.py  # cached top-2000 hot tokens from 2% of 1.3B train split
 python train.py --model hotcold_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
 python train.py --model twostage_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt --svd_switch_fraction 0.5
@@ -127,6 +129,8 @@ python metric.py --model baseline_plus --seq_len 1024
 python metric.py --model mla --seq_len 1024
 python metric.py --model hotcold_mla --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
 python metric.py --model mla_twostage_svd_mem12_monarch --n_layers 12 --memory_layers 12 --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
+python metric.py --model mla_twostage_svd_mem12_binarydp --n_layers 12 --memory_layers 12 --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
+python metric.py --model dp_shared_memory --n_layers 12 --memory_layers 12
 python metric.py --model hotcold_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
 python metric.py --model twostage_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
 ```
@@ -144,6 +148,8 @@ Five model variants are provided:
 | `mla` | DeepSeek-style latent attention | Depends on MLA dims | Low-rank Q/KV compression and reduced KV cache payload |
 | `hotcold_mla` | MLA + hot/cold vocab SVD | Depends on MLA + rank | MLA attention plus hot dense and cold low-rank vocab factors |
 | `mla_twostage_svd_mem12_monarch` | MLA + mid-switch SVD + mem12 + Monarch | Depends on dims | Dense vocab warmup then hot/cold SVD; 12 PK memory layers; Monarch O-proj |
+| `mla_twostage_svd_mem12_binarydp` | MLA + mid-switch SVD + mem12 + binary-DP memory | Depends on dims | Replaces 2-way PK retrieval with exact binary product-code top-k dynamic programming |
+| `dp_shared_memory` | Dense attention + binary-DP shared memory | Depends on dims | Removes MLA/SVD; keeps shared binary-DP memory layers as FF branch replacement |
 | `hotcold_svd` | Hot dense + cold SVD vocab | Depends on hot_k/rank | Top-2000 tokens dense, cold tokens rank-128 factors (tied embed/unembed) |
 | `twostage_svd` | Dense then SVD switch | Phase-dependent | Train dense for first half, then convert to hot/cold SVD and continue |
 
