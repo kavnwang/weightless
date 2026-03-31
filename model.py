@@ -4784,6 +4784,73 @@ class MLAHybridLoop12MonarchAttnSVDFfnTransformer(SimpleTransformer):
         )
 
 
+class MLAHybridLoop12MonarchAttnSVDFfnBinaryDPTransformer(MLAHybridLoop12MonarchAttnSVDFfnTransformer):
+    """Hybrid loop12 + Monarch attn + SVD FFN, with binary-DP memory layers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mem_binary_total_keys = self.mem_n_keys * self.mem_n_keys
+        self.mem_binary_buckets = int(math.log2(self.mem_binary_total_keys))
+        if (1 << self.mem_binary_buckets) != self.mem_binary_total_keys:
+            raise ValueError(
+                "Binary memory requires mem_n_keys^2 to be power-of-two. "
+                f"Got mem_n_keys={self.mem_n_keys} => total_keys={self.mem_binary_total_keys}."
+            )
+        if self.mem_k_dim % self.mem_binary_buckets != 0:
+            raise ValueError(
+                f"mem_k_dim must be divisible by num_binary_buckets={self.mem_binary_buckets}; "
+                f"got mem_k_dim={self.mem_k_dim}."
+            )
+
+        shared_value_store = (
+            BinaryCodeValueStore(self.mem_binary_total_keys, self.mem_v_dim)
+            if self.mem_share_values else None
+        )
+        for i in self.bottom_even_memory_layers:
+            self.layers[i].memory_layer = BinaryProductCodeMemoryLayer(
+                d_model=self.d_model,
+                mem_n_keys=self.mem_n_keys,
+                mem_heads=self.mem_heads,
+                mem_knn=self.mem_knn,
+                key_dim=self.mem_k_dim,
+                value_dim=self.mem_v_dim,
+                mem_q_rank=self.mem_q_rank,
+                value_store=shared_value_store,
+                memory_plus=False,
+                qk_norm=self.qk_norm,
+            )
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        profile = super().get_inference_profile(
+            seq_len=seq_len,
+            weight_dtype_bytes=weight_dtype_bytes,
+            kv_dtype_bytes=kv_dtype_bytes,
+            count_reuse=count_reuse,
+        )
+        wb = weight_dtype_bytes
+        M = len(self.bottom_even_memory_layers)
+        dense_memory_key_bytes = M * (self.mem_heads * self.mem_n_keys * self.mem_k_dim) * wb
+        binary_memory_key_bytes = M * (self.mem_heads * 2 * self.mem_k_dim) * wb
+        profile.ffn_bytes += (binary_memory_key_bytes - dense_memory_key_bytes)
+        profile.model_name = "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp"
+        profile.notes = (
+            f"phase={'hotcold+svd' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
+            f"mem_layers={self.bottom_even_memory_layers}; "
+            f"svd_ffn={self.svd_ffn_layers}; "
+            f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
+            f"binary_total_keys={self.mem_binary_total_keys}; "
+            f"binary_buckets={self.mem_binary_buckets}; "
+            f"top4_loopx{self.loop_repeats}"
+        )
+        return profile
+
+
 # ============================================================================
 # Factory
 # ============================================================================
@@ -4830,6 +4897,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_only_keys}
     if variant not in {
@@ -4841,6 +4909,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in hotcold_only_keys}
     if variant not in {
@@ -4851,6 +4920,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in twostage_only_keys}
     if variant not in {
@@ -4860,6 +4930,7 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_mem_monarch_only_keys}
 
@@ -4885,6 +4956,8 @@ def create_model(variant: str = "baseline", **kwargs):
         return MLAHybridLoop12MonarchTransformer(**kwargs)
     elif variant == "mla_hybrid_loop12_monarch_attn_svd_ffn":
         return MLAHybridLoop12MonarchAttnSVDFfnTransformer(**kwargs)
+    elif variant == "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp":
+        return MLAHybridLoop12MonarchAttnSVDFfnBinaryDPTransformer(**kwargs)
     elif variant == "hotcold_svd":
         return HotColdSVDTransformer(**kwargs)
     elif variant == "twostage_svd":
@@ -4911,6 +4984,7 @@ if __name__ == "__main__":
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
         "hotcold_svd",
         "twostage_svd",
         "loop_top4x3_attnres",
