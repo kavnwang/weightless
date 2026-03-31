@@ -3295,6 +3295,10 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
         qk_nope_head_dim: int | None = None,
         qk_rope_head_dim: int | None = None,
         v_head_dim: int | None = None,
+        hot_token_k: int = 2000,
+        cold_latent_dim: int = 128,
+        hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
+        svd_switch_fraction: float = 1.0 / 3.0,
         monarch_block_size: int = 32,
         memory_layers: int | list[int] | tuple[int, ...] = 12,
         mem_n_keys: int = 256,
@@ -3312,6 +3316,8 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
         nn.Module.__init__(self)
         if n_layers != 12:
             raise ValueError(f"mla_hybrid_loop12_monarch requires n_layers=12, got {n_layers}")
+        if not (0.0 <= svd_switch_fraction <= 1.0):
+            raise ValueError(f"svd_switch_fraction must be in [0, 1], got {svd_switch_fraction}")
         if loop_block_size != 4:
             raise ValueError(
                 f"mla_hybrid_loop12_monarch requires loop_block_size=4, got {loop_block_size}"
@@ -3355,6 +3361,10 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
         self.d_ff = d_ff
         self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.weight_tied = True
+        self.hot_token_k = hot_token_k
+        self.cold_latent_dim = cold_latent_dim
+        self.hot_token_cache_path = hot_token_cache_path
+        self.svd_switch_fraction = svd_switch_fraction
         self.monarch_block_size = monarch_block_size
         self.mem_n_keys = mem_n_keys
         self.mem_heads = mem_heads
@@ -3379,7 +3389,20 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
             + self.top_odd_monarch_layers
         )
 
-        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+
+        hot_token_ids = _load_hot_token_ids(
+            cache_path=hot_token_cache_path,
+            vocab_size=vocab_size,
+            hot_token_k=hot_token_k,
+        )
+        self.full_token_emb = nn.Embedding(vocab_size, d_model)
+        self.token_emb = HotColdTiedEmbedding(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            hot_token_ids=hot_token_ids,
+            cold_latent_dim=cold_latent_dim,
+        )
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryPositionalEmbedding(
             theta=rope_theta,
@@ -3443,8 +3466,6 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
                 )
             )
         self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-        self.head.weight = self.token_emb.weight
         self._init_weights(self.n_layers)
 
     @property
@@ -3454,10 +3475,45 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
     def _layer_exec_counts(self) -> list[int]:
         return [1 if i < self.loop_start else self.loop_repeats for i in range(self.n_layers)]
 
+    def _convert_embedding_to_hotcold(self):
+        if bool(self.uses_hotcold_flag.item()):
+            return
+        with torch.no_grad():
+            full_weight = self.full_token_emb.weight.detach()
+            hot_ids = self.token_emb.hot_token_ids
+            cold_ids = self.token_emb.cold_token_ids
+            self.token_emb.hot_emb.weight.copy_(full_weight[hot_ids])
+
+            cold_full = full_weight[cold_ids].float()
+            U, S, Vh = torch.linalg.svd(cold_full, full_matrices=False)
+            rank = min(self.cold_latent_dim, S.numel())
+            U_r = U[:, :rank]
+            S_r = S[:rank]
+            Vh_r = Vh[:rank, :]
+            cold_u = U_r * S_r.unsqueeze(0)
+
+            self.token_emb.cold_emb_u.weight.zero_()
+            self.token_emb.cold_emb_u.weight[:, :rank].copy_(
+                cold_u.to(self.token_emb.cold_emb_u.weight.dtype)
+            )
+            self.token_emb.cold_latent_to_model.weight.zero_()
+            self.token_emb.cold_latent_to_model.weight[:, :rank].copy_(
+                Vh_r.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
+            )
+            self.full_token_emb.weight.requires_grad_(False)
+            self.uses_hotcold_flag.fill_(True)
+
+    def convert_full_to_hotcold_svd(self):
+        # Monarch variant only swaps dense embedding/unembedding to hot/cold.
+        self._convert_embedding_to_hotcold()
+
     def forward(self, input_ids, attention_mask=None):
         _, T = input_ids.shape
         device = input_ids.device
-        x = self.token_emb(input_ids)
+        if bool(self.uses_hotcold_flag.item()):
+            x = self.token_emb(input_ids)
+        else:
+            x = self.full_token_emb(input_ids)
         x = self.dropout(x)
         positions = torch.arange(0, T, dtype=torch.long, device=device)
         causal_mask = torch.triu(torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1)
@@ -3490,7 +3546,9 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
                 exec_layer_number += 1
 
         x = self.ln_f(partial)
-        return self.head(x)
+        if bool(self.uses_hotcold_flag.item()):
+            return self.token_emb.logits(x)
+        return F.linear(x, self.full_token_emb.weight)
 
     def get_inference_profile(
         self,
@@ -3514,8 +3572,15 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
         exec_L = sum(exec_counts)
         M = len(self.bottom_even_memory_layers)
 
-        lm_head_bytes = V * d * wb
-        embedding_bytes = 0 if (self.weight_tied and not count_reuse) else d * wb
+        if bool(self.uses_hotcold_flag.item()):
+            r = self.cold_latent_dim
+            n_hot = self.token_emb.num_hot_tokens
+            n_cold = self.token_emb.num_cold_tokens
+            lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else max(d, r + d * r) * wb
+        else:
+            lm_head_bytes = V * d * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else d * wb
 
         attn_q_bytes = L * (d * dcp + dcp * (h * d_nope) + dcp * (h * d_rope)) * wb
         attn_k_bytes = L * (d * dc + dc * (h * d_nope) + d * d_rope) * wb
@@ -3590,6 +3655,7 @@ class MLAHybridLoop12MonarchTransformer(SimpleTransformer):
             unique_param_bytes=unique_numel * wb,
             unique_opt_state_bytes=unique_numel * 12,
             notes=(
+                f"phase={'hotcold_embed' if bool(self.uses_hotcold_flag.item()) else 'dense_embed'}; "
                 f"mem_layers={self.bottom_even_memory_layers}; "
                 f"monarch_ffn={self.monarch_ffn_layers}; "
                 f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
@@ -3638,9 +3704,9 @@ def create_model(variant: str = "baseline", **kwargs):
     }
     if variant not in {"mla", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_only_keys}
-    if variant not in {"hotcold_svd", "twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12"}:
+    if variant not in {"hotcold_svd", "twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
         kwargs = {k: v for k, v in kwargs.items() if k not in hotcold_only_keys}
-    if variant not in {"twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12"}:
+    if variant not in {"twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
         kwargs = {k: v for k, v in kwargs.items() if k not in twostage_only_keys}
     if variant not in {"mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_mem_monarch_only_keys}

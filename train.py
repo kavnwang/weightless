@@ -347,7 +347,7 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=None,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12: fraction of total steps before switching dense -> hot/cold SVD")
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12/mla_hybrid_loop12_monarch: fraction of total steps before switching dense -> hot/cold SVD")
     parser.add_argument("--monarch_block_size", type=int, default=32,
                         help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch")
     parser.add_argument("--memory_layers", type=int, default=12,
@@ -405,7 +405,11 @@ def main():
         # Keep eval cadence tied to a single epoch, even for multi-epoch continuous runs.
         args.eval_every = max(1, int(0.04 * steps_per_epoch))
     if args.svd_switch_fraction is None:
-        args.svd_switch_fraction = (1.0 / 3.0) if args.model == "mla_hybrid_loop12" else 0.5
+        args.svd_switch_fraction = (
+            1.0 / 3.0
+            if args.model in {"mla_hybrid_loop12", "mla_hybrid_loop12_monarch"}
+            else 0.5
+        )
 
     if is_main(use_ddp):
         if args.d_model != 768:
@@ -492,7 +496,13 @@ def main():
 
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        ddp_find_unused = args.model in {"twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12"}
+        ddp_find_unused = args.model in {
+            "twostage_svd",
+            "hotcold_mla",
+            "mla_twostage_svd_mem12_monarch",
+            "mla_hybrid_loop12",
+            "mla_hybrid_loop12_monarch",
+        }
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -526,6 +536,11 @@ def main():
                 del preview_model
             except Exception as e:
                 print(f"  Skipping projected post-switch profile: {e}")
+        projected_final_profile = post_switch_profile or profile
+        print(
+            "  Projected final bytes_per_token_infer "
+            f"(end-of-training architecture): {projected_final_profile.total_bytes:,} bytes"
+        )
 
         if use_wandb:
             import wandb
@@ -534,6 +549,7 @@ def main():
                 "params/total": total_params,
                 "params/nonzero": nonzero_params,
                 "metric/bytes_per_token_infer": profile.total_bytes,
+                "metric/projected_final_bytes_per_token_infer": projected_final_profile.total_bytes,
                 **{f"metric/{k}": v for k, v in bd.items()},
                 "metric/unique_param_bytes": profile.unique_param_bytes,
                 "metric/unique_opt_state_bytes": profile.unique_opt_state_bytes,
