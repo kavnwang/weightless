@@ -105,7 +105,7 @@ def main():
                         help="Path to model checkpoint (.pt file)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "loop_top4x3_attnres"])
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
@@ -127,7 +127,17 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=0.5,
-                        help="For twostage_svd/hotcold_mla: fraction of train steps before dense -> hot/cold switch")
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch: fraction of train steps before dense -> hot/cold switch")
+    parser.add_argument("--monarch_block_size", type=int, default=32)
+    parser.add_argument("--memory_layers", type=int, default=12)
+    parser.add_argument("--mem_n_keys", type=int, default=256)
+    parser.add_argument("--mem_heads", type=int, default=4)
+    parser.add_argument("--mem_knn", type=int, default=32)
+    parser.add_argument("--mem_k_dim", type=int, default=None)
+    parser.add_argument("--mem_v_dim", type=int, default=None)
+    parser.add_argument("--mem_q_rank", type=int, default=None)
+    parser.add_argument("--no_mem_share_values", action="store_true")
+    parser.add_argument("--qk_norm", action="store_true")
     parser.add_argument("--seq_len", type=int, default=512,
                         help="Context length for bytes_per_token_infer metric")
     parser.add_argument("--visualize", action="store_true",
@@ -153,6 +163,16 @@ def main():
         cold_latent_dim=args.cold_latent_dim,
         hot_token_cache_path=args.hot_token_cache_path,
         svd_switch_fraction=args.svd_switch_fraction,
+        monarch_block_size=args.monarch_block_size,
+        memory_layers=args.memory_layers,
+        mem_n_keys=args.mem_n_keys,
+        mem_heads=args.mem_heads,
+        mem_knn=args.mem_knn,
+        mem_k_dim=args.mem_k_dim,
+        mem_v_dim=args.mem_v_dim,
+        mem_q_rank=args.mem_q_rank,
+        mem_share_values=not args.no_mem_share_values,
+        qk_norm=args.qk_norm,
     )
     
     if args.checkpoint is not None:

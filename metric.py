@@ -374,7 +374,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Compute bytes_per_token_infer for a model")
-    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "loop_top4x3_attnres"],
+    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres"],
                         help="Model variant to profile")
     parser.add_argument("--seq_len", type=int, default=512, help="Context length for KV cache")
     parser.add_argument("--d_model", type=int, default=None)
@@ -390,6 +390,16 @@ if __name__ == "__main__":
     parser.add_argument("--cold_latent_dim", type=int, default=None)
     parser.add_argument("--hot_token_cache_path", type=str, default=None)
     parser.add_argument("--svd_switch_fraction", type=float, default=None)
+    parser.add_argument("--monarch_block_size", type=int, default=None)
+    parser.add_argument("--memory_layers", type=int, default=None)
+    parser.add_argument("--mem_n_keys", type=int, default=None)
+    parser.add_argument("--mem_heads", type=int, default=None)
+    parser.add_argument("--mem_knn", type=int, default=None)
+    parser.add_argument("--mem_k_dim", type=int, default=None)
+    parser.add_argument("--mem_v_dim", type=int, default=None)
+    parser.add_argument("--mem_q_rank", type=int, default=None)
+    parser.add_argument("--mem_share_values", type=int, default=None)
+    parser.add_argument("--qk_norm", type=int, default=None)
     args = parser.parse_args()
 
     from model import create_model
@@ -421,6 +431,26 @@ if __name__ == "__main__":
         kwargs["hot_token_cache_path"] = args.hot_token_cache_path
     if args.svd_switch_fraction is not None:
         kwargs["svd_switch_fraction"] = args.svd_switch_fraction
+    if args.monarch_block_size is not None:
+        kwargs["monarch_block_size"] = args.monarch_block_size
+    if args.memory_layers is not None:
+        kwargs["memory_layers"] = args.memory_layers
+    if args.mem_n_keys is not None:
+        kwargs["mem_n_keys"] = args.mem_n_keys
+    if args.mem_heads is not None:
+        kwargs["mem_heads"] = args.mem_heads
+    if args.mem_knn is not None:
+        kwargs["mem_knn"] = args.mem_knn
+    if args.mem_k_dim is not None:
+        kwargs["mem_k_dim"] = args.mem_k_dim
+    if args.mem_v_dim is not None:
+        kwargs["mem_v_dim"] = args.mem_v_dim
+    if args.mem_q_rank is not None:
+        kwargs["mem_q_rank"] = args.mem_q_rank
+    if args.mem_share_values is not None:
+        kwargs["mem_share_values"] = bool(args.mem_share_values)
+    if args.qk_norm is not None:
+        kwargs["qk_norm"] = bool(args.qk_norm)
 
     model = create_model(variant=args.model, **kwargs)
 
