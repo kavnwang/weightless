@@ -328,7 +328,7 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres"],
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"],
                         help="Model variant")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="MLA KV latent rank (d_c); used for --model mla/hotcold_mla")
@@ -346,8 +346,8 @@ def main():
                         help="Rank for cold-token SVD factors; used for --model hotcold_svd/hotcold_mla/twostage_svd")
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
-    parser.add_argument("--svd_switch_fraction", type=float, default=0.5,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch: fraction of total steps before switching dense -> hot/cold SVD")
+    parser.add_argument("--svd_switch_fraction", type=float, default=None,
+                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_hybrid_loop12: fraction of total steps before switching dense -> hot/cold SVD")
     parser.add_argument("--monarch_block_size", type=int, default=32,
                         help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch")
     parser.add_argument("--memory_layers", type=int, default=12,
@@ -377,6 +377,15 @@ def main():
     parser.add_argument("--save_checkpoint", action="store_true",
                         help="Save model checkpoint at end of training")
     args = parser.parse_args()
+    if args.model in {"mla_hybrid_loop12", "mla_hybrid_loop12_monarch"} and args.n_layers == 8:
+        # Keep CLI ergonomic: these variants are fixed to 12 layers.
+        args.n_layers = 12
+    if args.model == "mla_hybrid_loop12_monarch" and args.d_model == 768:
+        # New monarch-only hybrid defaults to d_model=1024.
+        args.d_model = 1024
+    if args.model == "mla_hybrid_loop12_monarch" and args.d_ff == 2048:
+        # Monarch FFN path in this variant is square: d_ff must match d_model.
+        args.d_ff = args.d_model
     if args.dataset_epochs < 1:
         raise ValueError(f"--dataset_epochs must be >= 1, got {args.dataset_epochs}")
     user_set_num_steps = args.num_steps is not None
@@ -398,6 +407,8 @@ def main():
     if args.eval_every is None:
         # Keep eval cadence tied to a single epoch, even for multi-epoch continuous runs.
         args.eval_every = max(1, int(0.04 * steps_per_epoch))
+    if args.svd_switch_fraction is None:
+        args.svd_switch_fraction = (1.0 / 3.0) if args.model == "mla_hybrid_loop12" else 0.5
 
     if is_main(use_ddp):
         if args.d_model != 768:
@@ -452,7 +463,7 @@ def main():
     # Model
     if is_main(use_ddp):
         print(f"  Creating model (variant={args.model}, BF16 + torch.compile)...")
-    model = create_model(
+    model_kwargs = dict(
         variant=args.model,
         d_model=args.d_model,
         n_layers=args.n_layers,
@@ -478,12 +489,13 @@ def main():
         mem_share_values=not args.no_mem_share_values,
         qk_norm=args.qk_norm,
     )
+    model = create_model(**model_kwargs)
     model.to(device)
     model = torch.compile(model)
 
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        ddp_find_unused = args.model in {"twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch"}
+        ddp_find_unused = args.model in {"twostage_svd", "hotcold_mla", "mla_twostage_svd_mem12_monarch", "mla_hybrid_loop12"}
         model = DDP(
             model,
             device_ids=[local_rank],
@@ -504,18 +516,40 @@ def main():
         # Show the bytes_per_token_infer breakdown
         profile = raw_model.get_inference_profile()
         print_profile(profile)
+        post_switch_profile = None
+        if hasattr(raw_model, "convert_full_to_hotcold_svd"):
+            # Compute a projected post-switch profile at startup so we can compare
+            # the eventual compressed inference footprint before training begins.
+            try:
+                preview_model = create_model(**model_kwargs)
+                preview_model.convert_full_to_hotcold_svd()
+                post_switch_profile = preview_model.get_inference_profile()
+                print("  Projected post-switch inference profile (dense->SVD):")
+                print_profile(post_switch_profile)
+                del preview_model
+            except Exception as e:
+                print(f"  Skipping projected post-switch profile: {e}")
 
         if use_wandb:
             import wandb
             bd = profile.breakdown_dict()
-            wandb.log({
+            log_payload = {
                 "params/total": total_params,
                 "params/nonzero": nonzero_params,
                 "metric/bytes_per_token_infer": profile.total_bytes,
                 **{f"metric/{k}": v for k, v in bd.items()},
                 "metric/unique_param_bytes": profile.unique_param_bytes,
                 "metric/unique_opt_state_bytes": profile.unique_opt_state_bytes,
-            })
+            }
+            if post_switch_profile is not None:
+                post_bd = post_switch_profile.breakdown_dict()
+                log_payload.update({
+                    "metric_postswitch/bytes_per_token_infer": post_switch_profile.total_bytes,
+                    **{f"metric_postswitch/{k}": v for k, v in post_bd.items()},
+                    "metric_postswitch/unique_param_bytes": post_switch_profile.unique_param_bytes,
+                    "metric_postswitch/unique_opt_state_bytes": post_switch_profile.unique_opt_state_bytes,
+                })
+            wandb.log(log_payload)
 
     # Optimizer
     optimizer = torch.optim.AdamW(

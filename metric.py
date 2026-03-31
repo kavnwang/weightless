@@ -374,7 +374,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Compute bytes_per_token_infer for a model")
-    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres"],
+    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch"],
                         help="Model variant to profile")
     parser.add_argument("--seq_len", type=int, default=512, help="Context length for KV cache")
     parser.add_argument("--d_model", type=int, default=None)

@@ -32,6 +32,7 @@ wandb/
 outputs/
 checkpoints/
 *.pt
+!cache/hot_tokens_train1p3b_top2000.pt
 *.pth
 *.ckpt
 runs/
