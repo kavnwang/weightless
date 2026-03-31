@@ -25,7 +25,11 @@ def evaluate(model, dataloader, device):
     model.to(device)
     
     total_loss = 0.0
+    total_hot_loss = 0.0
+    total_cold_loss = 0.0
     total_tokens = 0
+    total_hot_tokens = 0
+    total_cold_tokens = 0
     n_batches = 0
     
     for batch in tqdm(dataloader, desc="Evaluating"):
@@ -36,15 +40,39 @@ def evaluate(model, dataloader, device):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(input_ids, attention_mask)
         
-        loss = F.cross_entropy(
+        token_losses = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),
             labels.reshape(-1),
-            reduction="sum",
+            reduction="none",
         )
-        
-        n_tokens = attention_mask.sum().item()
-        total_loss += loss.item()
+
+        flat_labels = labels.reshape(-1)
+        valid_mask = attention_mask.reshape(-1) > 0
+        n_tokens = valid_mask.sum().item()
+        total_loss += token_losses[valid_mask].sum().item()
         total_tokens += n_tokens
+        raw_model = model.module if hasattr(model, "module") else model
+        if hasattr(raw_model, "_orig_mod"):
+            raw_model = raw_model._orig_mod
+        if hasattr(raw_model, "token_partition_masks"):
+            hot_mask, cold_mask = raw_model.token_partition_masks(labels)
+            if hot_mask is not None and cold_mask is not None:
+                hot_mask = hot_mask.reshape(-1) & valid_mask
+                cold_mask = cold_mask.reshape(-1) & valid_mask
+                if hot_mask.any():
+                    total_hot_loss += F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1))[hot_mask],
+                        flat_labels[hot_mask],
+                        reduction="sum",
+                    ).item()
+                    total_hot_tokens += hot_mask.sum().item()
+                if cold_mask.any():
+                    total_cold_loss += F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1))[cold_mask],
+                        flat_labels[cold_mask],
+                        reduction="sum",
+                    ).item()
+                    total_cold_tokens += cold_mask.sum().item()
         n_batches += 1
         
     avg_loss = total_loss / total_tokens
@@ -60,6 +88,8 @@ def evaluate(model, dataloader, device):
     
     return {
         "val_loss": avg_loss,
+        "hot_loss": (total_hot_loss / total_hot_tokens) if total_hot_tokens > 0 else None,
+        "cold_loss": (total_cold_loss / total_cold_tokens) if total_cold_tokens > 0 else None,
         "perplexity": perplexity,
         "total_params": total_params,
         "nonzero_params": nonzero_params,
@@ -75,21 +105,29 @@ def main():
                         help="Path to model checkpoint (.pt file)")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"])
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "loop_top4x3_attnres"])
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--n_layers", type=int, default=8)
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--kv_lora_rank", type=int, default=None,
-                        help="MLA KV latent rank (d_c); only used for --model mla")
+                        help="MLA KV latent rank (d_c); used for --model mla/hotcold_mla")
     parser.add_argument("--q_lora_rank", type=int, default=None,
-                        help="MLA query latent rank (d'_c); only used for --model mla")
+                        help="MLA query latent rank (d'_c); used for --model mla/hotcold_mla")
     parser.add_argument("--qk_nope_head_dim", type=int, default=None,
-                        help="MLA non-RoPE per-head Q/K dim; only used for --model mla")
+                        help="MLA non-RoPE per-head Q/K dim; used for --model mla/hotcold_mla")
     parser.add_argument("--qk_rope_head_dim", type=int, default=None,
-                        help="MLA RoPE per-head Q/K dim (must be even); only used for --model mla")
+                        help="MLA RoPE per-head Q/K dim (must be even); used for --model mla/hotcold_mla")
     parser.add_argument("--v_head_dim", type=int, default=None,
-                        help="MLA per-head V dim; only used for --model mla")
+                        help="MLA per-head V dim; used for --model mla/hotcold_mla")
+    parser.add_argument("--hot_token_k", type=int, default=2000,
+                        help="Number of dense hot tokens; used for --model hotcold_svd/hotcold_mla/twostage_svd")
+    parser.add_argument("--cold_latent_dim", type=int, default=128,
+                        help="Rank for cold-token SVD factors; used for --model hotcold_svd/hotcold_mla/twostage_svd")
+    parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
+                        help="Path to cached hot tokens from build_hot_token_cache.py")
+    parser.add_argument("--svd_switch_fraction", type=float, default=0.5,
+                        help="For twostage_svd/hotcold_mla: fraction of train steps before dense -> hot/cold switch")
     parser.add_argument("--seq_len", type=int, default=512,
                         help="Context length for bytes_per_token_infer metric")
     parser.add_argument("--visualize", action="store_true",
@@ -111,6 +149,10 @@ def main():
         qk_nope_head_dim=args.qk_nope_head_dim,
         qk_rope_head_dim=args.qk_rope_head_dim,
         v_head_dim=args.v_head_dim,
+        hot_token_k=args.hot_token_k,
+        cold_latent_dim=args.cold_latent_dim,
+        hot_token_cache_path=args.hot_token_cache_path,
+        svd_switch_fraction=args.svd_switch_fraction,
     )
     
     if args.checkpoint is not None:
@@ -136,6 +178,10 @@ def main():
     print("  EVALUATION RESULTS")
     print("=" * 60)
     print(f"  Validation Loss:    {metrics['val_loss']:.4f}")
+    if metrics["hot_loss"] is not None:
+        print(f"  Hot Token Loss:     {metrics['hot_loss']:.4f}")
+    if metrics["cold_loss"] is not None:
+        print(f"  Cold Token Loss:    {metrics['cold_loss']:.4f}")
     print(f"  Perplexity:         {metrics['perplexity']:.2f}")
     print(f"  Total Parameters:   {metrics['total_params']:,}")
     print(f"  Non-zero Params:    {metrics['nonzero_params']:,}")

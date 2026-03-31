@@ -15,6 +15,7 @@ Six variants are provided:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 from rope import RotaryPositionalEmbedding
 from metric import InferenceProfile
@@ -22,6 +23,148 @@ from metric import InferenceProfile
 # GPT-2 tokenizer vocab size
 VOCAB_SIZE = 50257
 SEQ_LEN = 512  # 513 - 1 for causal LM
+DEFAULT_HOT_TOKEN_CACHE_PATH = "cache/hot_tokens_train1p3b_top2000.pt"
+
+
+def _load_hot_token_ids(
+    cache_path: str,
+    vocab_size: int,
+    hot_token_k: int,
+) -> torch.Tensor:
+    if not os.path.exists(cache_path):
+        raise FileNotFoundError(
+            f"Hot-token cache not found at '{cache_path}'. "
+            f"Build it first with: python build_hot_token_cache.py --cache_path {cache_path}"
+        )
+    payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict) or "hot_token_ids" not in payload:
+        raise ValueError(
+            f"Invalid hot-token cache at '{cache_path}': missing 'hot_token_ids'."
+        )
+    token_ids = torch.as_tensor(payload["hot_token_ids"], dtype=torch.long).flatten()
+    split = payload.get("split")
+    subset = payload.get("subset")
+    if split is not None and split != "train":
+        raise ValueError(
+            f"Hot-token cache split must be 'train' (1.3B train split in this repo), got '{split}'."
+        )
+    if subset is not None and subset != "sample-10BT_max_length_513":
+        raise ValueError(
+            f"Hot-token cache subset must be 'sample-10BT_max_length_513', got '{subset}'."
+        )
+    if token_ids.numel() < hot_token_k:
+        raise ValueError(
+            f"Hot-token cache has only {token_ids.numel()} ids but requested {hot_token_k}."
+        )
+    token_ids = token_ids[:hot_token_k]
+    if token_ids.min().item() < 0 or token_ids.max().item() >= vocab_size:
+        raise ValueError(
+            f"Hot-token cache contains out-of-range ids for vocab_size={vocab_size}."
+        )
+    if torch.unique(token_ids).numel() != token_ids.numel():
+        raise ValueError("Hot-token cache contains duplicate token ids.")
+    return token_ids
+
+
+class HotColdTiedEmbedding(nn.Module):
+    """Tied token embedding + output projection with hot/cold factorization.
+
+    Hot tokens are stored as full d_model vectors.
+    Cold tokens are stored as rank-r factors: U[token, r] and V[r, d_model].
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        hot_token_ids: torch.Tensor,
+        cold_latent_dim: int = 128,
+    ):
+        super().__init__()
+        if cold_latent_dim < 1:
+            raise ValueError(f"cold_latent_dim must be >= 1, got {cold_latent_dim}")
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.cold_latent_dim = cold_latent_dim
+
+        hot_token_ids = hot_token_ids.to(torch.long).flatten()
+        hot_mask = torch.zeros(vocab_size, dtype=torch.bool)
+        hot_mask[hot_token_ids] = True
+        cold_token_ids = torch.nonzero(~hot_mask, as_tuple=False).squeeze(-1)
+
+        token_to_hot_idx = torch.full((vocab_size,), -1, dtype=torch.long)
+        token_to_hot_idx[hot_token_ids] = torch.arange(hot_token_ids.numel(), dtype=torch.long)
+        token_to_cold_idx = torch.full((vocab_size,), -1, dtype=torch.long)
+        token_to_cold_idx[cold_token_ids] = torch.arange(cold_token_ids.numel(), dtype=torch.long)
+
+        self.register_buffer("hot_token_ids", hot_token_ids, persistent=True)
+        self.register_buffer("cold_token_ids", cold_token_ids, persistent=True)
+        self.register_buffer("hot_token_mask", hot_mask, persistent=True)
+        self.register_buffer("token_to_hot_idx", token_to_hot_idx, persistent=False)
+        self.register_buffer("token_to_cold_idx", token_to_cold_idx, persistent=False)
+
+        self.num_hot_tokens = hot_token_ids.numel()
+        self.num_cold_tokens = cold_token_ids.numel()
+
+        self.hot_emb = nn.Embedding(self.num_hot_tokens, d_model)
+        self.cold_emb_u = nn.Embedding(self.num_cold_tokens, cold_latent_dim)
+        self.cold_latent_to_model = nn.Linear(cold_latent_dim, d_model, bias=False)
+
+    def token_is_hot(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.hot_token_mask[token_ids]
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        flat_ids = input_ids.reshape(-1)
+        hot_pos = self.hot_token_mask[flat_ids]
+        out = torch.empty(
+            flat_ids.numel(),
+            self.d_model,
+            device=flat_ids.device,
+            dtype=self.hot_emb.weight.dtype,
+        )
+
+        if hot_pos.any():
+            hot_ids = flat_ids[hot_pos]
+            out[hot_pos] = self.hot_emb(self.token_to_hot_idx[hot_ids]).to(out.dtype)
+        if (~hot_pos).any():
+            cold_ids = flat_ids[~hot_pos]
+            cold_latent = self.cold_emb_u(self.token_to_cold_idx[cold_ids])
+            out[~hot_pos] = self.cold_latent_to_model(cold_latent).to(out.dtype)
+        return out.view(*input_ids.shape, self.d_model)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed(input_ids)
+
+    def _cold_full_weight(self) -> torch.Tensor:
+        # U @ V where U is [num_cold, r], V is [r, d_model]
+        return self.cold_emb_u.weight @ self.cold_latent_to_model.weight.T
+
+    def full_weight(self) -> torch.Tensor:
+        full = torch.empty(
+            self.vocab_size,
+            self.d_model,
+            device=self.hot_emb.weight.device,
+            dtype=self.hot_emb.weight.dtype,
+        )
+        full[self.hot_token_ids] = self.hot_emb.weight
+        full[self.cold_token_ids] = self._cold_full_weight()
+        return full
+
+    def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        out_shape = (*hidden_states.shape[:-1], self.vocab_size)
+        logits = torch.empty(
+            out_shape,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        hot_logits = torch.matmul(hidden_states, self.hot_emb.weight.T)
+        logits[..., self.hot_token_ids] = hot_logits
+
+        hidden_latent = torch.matmul(hidden_states, self.cold_latent_to_model.weight)
+        cold_logits = torch.matmul(hidden_latent, self.cold_emb_u.weight.T)
+        logits[..., self.cold_token_ids] = cold_logits
+        return logits
 
 
 # ============================================================================
@@ -224,6 +367,409 @@ class SimpleTransformer(nn.Module):
             kv_cache_write_bytes=kv_cache_write_bytes,
             unique_param_bytes=unique_numel * wb,
             unique_opt_state_bytes=unique_numel * 12,
+        )
+
+    def token_partition_masks(self, token_ids: torch.Tensor):
+        """Optional token partitioning hook for loss reporting."""
+        return None, None
+
+
+class HotColdSVDTransformer(SimpleTransformer):
+    """Transformer with hot-token dense embeddings and cold-token SVD factors."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        hot_token_k: int = 2000,
+        cold_latent_dim: int = 128,
+        hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
+        svd_switch_fraction: float = 0.5,
+    ):
+        nn.Module.__init__(self)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = d_model // n_heads
+        self.weight_tied = True
+        self.hot_token_k = hot_token_k
+        self.cold_latent_dim = cold_latent_dim
+        self.hot_token_cache_path = hot_token_cache_path
+
+        hot_token_ids = _load_hot_token_ids(
+            cache_path=hot_token_cache_path,
+            vocab_size=vocab_size,
+            hot_token_k=hot_token_k,
+        )
+        self.token_emb = HotColdTiedEmbedding(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            hot_token_ids=hot_token_ids,
+            cold_latent_dim=cold_latent_dim,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+
+        self._init_weights(n_layers)
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        x = self.token_emb(input_ids)
+        x = self.dropout(x)
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
+        )
+
+        for layer in self.layers:
+            x = layer(x, causal_mask, attention_mask, self.rope, positions)
+
+        x = self.ln_f(x)
+        logits = self.token_emb.logits(x)
+        return logits
+
+    def token_partition_masks(self, token_ids: torch.Tensor):
+        hot_mask = self.token_emb.token_is_hot(token_ids)
+        cold_mask = ~hot_mask
+        return hot_mask, cold_mask
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        kv_h = self.n_kv_heads
+        hd = self.head_dim
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        r = self.cold_latent_dim
+        n_hot = self.token_emb.num_hot_tokens
+        n_cold = self.token_emb.num_cold_tokens
+
+        # Split LM head read:
+        # - hot logits: hidden @ W_hot^T
+        # - cold logits: (hidden @ V^T) @ U^T
+        lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+        if self.weight_tied and not count_reuse:
+            embedding_bytes = 0
+        else:
+            # One token lookup: either dense hot row or latent cold row + projector.
+            embedding_bytes = max(d, r + d * r) * wb
+
+        attn_q_bytes = L * d * (h * hd) * wb
+        attn_k_bytes = L * d * (kv_h * hd) * wb
+        attn_v_bytes = L * d * (kv_h * hd) * wb
+        attn_o_bytes = L * (h * hd) * d * wb
+        ffn_bytes = L * (
+            d * self.d_ff
+            + self.d_ff * d
+            + d * self.d_ff
+        ) * wb
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
+        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="hotcold_svd",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=kv_h,
+            head_dim=hd,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"hot={n_hot}, cold={n_cold}, cold_rank={r}, "
+                f"cache={self.hot_token_cache_path}"
+            ),
+        )
+
+
+class TwoStageSVDTransformer(SimpleTransformer):
+    """Two-stage vocab training: dense first, then hot/cold SVD compression."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        hot_token_k: int = 2000,
+        cold_latent_dim: int = 128,
+        hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
+        svd_switch_fraction: float = 0.5,
+    ):
+        nn.Module.__init__(self)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = n_heads
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = d_model // n_heads
+        self.weight_tied = True
+        self.hot_token_k = hot_token_k
+        self.cold_latent_dim = cold_latent_dim
+        self.hot_token_cache_path = hot_token_cache_path
+        if not (0.0 <= svd_switch_fraction <= 1.0):
+            raise ValueError(f"svd_switch_fraction must be in [0, 1], got {svd_switch_fraction}")
+        self.svd_switch_fraction = svd_switch_fraction
+        self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+
+        hot_token_ids = _load_hot_token_ids(
+            cache_path=hot_token_cache_path,
+            vocab_size=vocab_size,
+            hot_token_k=hot_token_k,
+        )
+        self.full_token_emb = nn.Embedding(vocab_size, d_model)
+        self.token_emb = self.full_token_emb
+        self.hotcold_emb = HotColdTiedEmbedding(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            hot_token_ids=hot_token_ids,
+            cold_latent_dim=cold_latent_dim,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.head_dim,
+            max_seq_len=max_seq_len,
+        )
+        self.layers = nn.ModuleList([
+            TransformerBlock(d_model, n_heads, n_heads, d_ff, dropout)
+            for _ in range(n_layers)
+        ])
+        self.ln_f = nn.LayerNorm(d_model)
+        self._init_weights(n_layers)
+
+    def convert_full_to_hotcold_svd(self):
+        """Initialize hot/cold factors from the current dense embedding matrix."""
+        if bool(self.uses_hotcold_flag.item()):
+            return
+        with torch.no_grad():
+            full_weight = self.full_token_emb.weight.detach()
+            hot_ids = self.hotcold_emb.hot_token_ids
+            cold_ids = self.hotcold_emb.cold_token_ids
+
+            self.hotcold_emb.hot_emb.weight.copy_(full_weight[hot_ids])
+
+            cold_full = full_weight[cold_ids].float()
+            U, S, Vh = torch.linalg.svd(cold_full, full_matrices=False)
+            rank = min(self.cold_latent_dim, S.numel())
+            U_r = U[:, :rank]
+            S_r = S[:rank]
+            Vh_r = Vh[:rank, :]
+            cold_u = U_r * S_r.unsqueeze(0)
+
+            self.hotcold_emb.cold_emb_u.weight.zero_()
+            self.hotcold_emb.cold_emb_u.weight[:, :rank].copy_(cold_u.to(self.hotcold_emb.cold_emb_u.weight.dtype))
+
+            self.hotcold_emb.cold_latent_to_model.weight.zero_()
+            self.hotcold_emb.cold_latent_to_model.weight[:, :rank].copy_(
+                Vh_r.T.to(self.hotcold_emb.cold_latent_to_model.weight.dtype)
+            )
+
+            self.full_token_emb.weight.requires_grad_(False)
+            self.uses_hotcold_flag.fill_(True)
+
+    def token_partition_masks(self, token_ids: torch.Tensor):
+        hot_mask = self.hotcold_emb.token_is_hot(token_ids)
+        cold_mask = ~hot_mask
+        return hot_mask, cold_mask
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+
+        if bool(self.uses_hotcold_flag.item()):
+            x = self.hotcold_emb(input_ids)
+        else:
+            x = self.full_token_emb(input_ids)
+        x = self.dropout(x)
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
+        )
+        for layer in self.layers:
+            x = layer(x, causal_mask, attention_mask, self.rope, positions)
+        x = self.ln_f(x)
+        if bool(self.uses_hotcold_flag.item()):
+            return self.hotcold_emb.logits(x)
+        return F.linear(x, self.full_token_emb.weight)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        if not bool(self.uses_hotcold_flag.item()):
+            d = self.d_model
+            h = self.n_heads
+            kv_h = self.n_kv_heads
+            hd = self.head_dim
+            L = self.n_layers
+            V = self.vocab_size
+            wb = weight_dtype_bytes
+            kb = kv_dtype_bytes
+            lm_head_bytes = V * d * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else d * wb
+            attn_q_bytes = L * d * (h * hd) * wb
+            attn_k_bytes = L * d * (kv_h * hd) * wb
+            attn_v_bytes = L * d * (kv_h * hd) * wb
+            attn_o_bytes = L * (h * hd) * d * wb
+            ffn_bytes = L * (d * self.d_ff + self.d_ff * d + d * self.d_ff) * wb
+            norm_bytes = (2 * L + 1) * 2 * d * wb
+            kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
+            kv_cache_write_bytes = 2 * kv_h * hd * L * kb
+            seen_ptrs: set[int] = set()
+            unique_numel = 0
+            for p in self.parameters():
+                ptr = p.data_ptr()
+                if ptr not in seen_ptrs:
+                    seen_ptrs.add(ptr)
+                    unique_numel += p.numel()
+            return InferenceProfile(
+                model_name="twostage_svd_dense_phase",
+                d_model=d,
+                n_layers=L,
+                n_heads=h,
+                n_kv_heads=kv_h,
+                head_dim=hd,
+                d_ff=self.d_ff,
+                vocab_size=V,
+                seq_len=seq_len,
+                weight_dtype_bytes=wb,
+                kv_dtype_bytes=kb,
+                count_reuse=count_reuse,
+                embedding_bytes=embedding_bytes,
+                attn_q_bytes=attn_q_bytes,
+                attn_k_bytes=attn_k_bytes,
+                attn_v_bytes=attn_v_bytes,
+                attn_o_bytes=attn_o_bytes,
+                ffn_bytes=ffn_bytes,
+                norm_bytes=norm_bytes,
+                lm_head_bytes=lm_head_bytes,
+                kv_cache_read_bytes=kv_cache_read_bytes,
+                kv_cache_write_bytes=kv_cache_write_bytes,
+                unique_param_bytes=unique_numel * wb,
+                unique_opt_state_bytes=unique_numel * 12,
+                notes="dense phase (pre-switch)",
+            )
+
+        d = self.d_model
+        h = self.n_heads
+        kv_h = self.n_kv_heads
+        hd = self.head_dim
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        r = self.cold_latent_dim
+        n_hot = self.hotcold_emb.num_hot_tokens
+        n_cold = self.hotcold_emb.num_cold_tokens
+        lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+        embedding_bytes = 0 if (self.weight_tied and not count_reuse) else max(d, r + d * r) * wb
+        attn_q_bytes = L * d * (h * hd) * wb
+        attn_k_bytes = L * d * (kv_h * hd) * wb
+        attn_v_bytes = L * d * (kv_h * hd) * wb
+        attn_o_bytes = L * (h * hd) * d * wb
+        ffn_bytes = L * (d * self.d_ff + self.d_ff * d + d * self.d_ff) * wb
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+        kv_cache_read_bytes = 2 * kv_h * hd * seq_len * L * kb
+        kv_cache_write_bytes = 2 * kv_h * hd * L * kb
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+        return InferenceProfile(
+            model_name="twostage_svd_hotcold_phase",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=kv_h,
+            head_dim=hd,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes="compressed hot/cold phase (post-switch)",
         )
 
 
@@ -1112,6 +1658,260 @@ class MLATransformer(SimpleTransformer):
         )
 
 
+class HotColdMLATransformer(SimpleTransformer):
+    """MLA attention with dense->hot/cold mid-training switch."""
+
+    def __init__(
+        self,
+        vocab_size: int = VOCAB_SIZE,
+        d_model: int = 768,
+        n_heads: int = 8,
+        n_layers: int = 8,
+        d_ff: int = 2048,
+        dropout: float = 0.1,
+        max_seq_len: int = SEQ_LEN,
+        rope_theta: float = 10000.0,
+        kv_lora_rank: int | None = None,
+        q_lora_rank: int | None = None,
+        qk_nope_head_dim: int | None = None,
+        qk_rope_head_dim: int | None = None,
+        v_head_dim: int | None = None,
+        hot_token_k: int = 2000,
+        cold_latent_dim: int = 128,
+        hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
+        svd_switch_fraction: float = 0.5,
+    ):
+        nn.Module.__init__(self)
+
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        head_dim = d_model // n_heads
+
+        default_rope_dim = max(2, (head_dim // 2) * 2)
+        self.kv_lora_rank = kv_lora_rank if kv_lora_rank is not None else max(16, d_model // 8)
+        self.q_lora_rank = q_lora_rank if q_lora_rank is not None else max(16, d_model // 8)
+        self.qk_nope_head_dim = qk_nope_head_dim if qk_nope_head_dim is not None else head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim if qk_rope_head_dim is not None else default_rope_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else head_dim
+        assert self.qk_rope_head_dim % 2 == 0, "qk_rope_head_dim must be even"
+
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_kv_heads = 1
+        self.n_layers = n_layers
+        self.d_ff = d_ff
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.weight_tied = True
+        self.hot_token_k = hot_token_k
+        self.cold_latent_dim = cold_latent_dim
+        self.hot_token_cache_path = hot_token_cache_path
+        if not (0.0 <= svd_switch_fraction <= 1.0):
+            raise ValueError(f"svd_switch_fraction must be in [0, 1], got {svd_switch_fraction}")
+        self.svd_switch_fraction = svd_switch_fraction
+        self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+
+        hot_token_ids = _load_hot_token_ids(
+            cache_path=hot_token_cache_path,
+            vocab_size=vocab_size,
+            hot_token_k=hot_token_k,
+        )
+        self.full_token_emb = nn.Embedding(vocab_size, d_model)
+        self.token_emb = HotColdTiedEmbedding(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            hot_token_ids=hot_token_ids,
+            cold_latent_dim=cold_latent_dim,
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        self.rope = RotaryPositionalEmbedding(
+            theta=rope_theta,
+            d_key=self.qk_rope_head_dim,
+            max_seq_len=max_seq_len,
+        )
+
+        mla_kwargs = {
+            "kv_lora_rank": self.kv_lora_rank,
+            "q_lora_rank": self.q_lora_rank,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "v_head_dim": self.v_head_dim,
+        }
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                d_model,
+                n_heads,
+                n_heads,
+                d_ff,
+                dropout,
+                attention_type="mla",
+                mla_kwargs=mla_kwargs,
+            )
+            for _ in range(n_layers)
+        ])
+
+        self.ln_f = nn.LayerNorm(d_model)
+        self._init_weights(n_layers)
+
+    def convert_full_to_hotcold_svd(self):
+        """Initialize hot/cold factors from dense embedding and enable compressed path."""
+        if bool(self.uses_hotcold_flag.item()):
+            return
+        with torch.no_grad():
+            full_weight = self.full_token_emb.weight.detach()
+            hot_ids = self.token_emb.hot_token_ids
+            cold_ids = self.token_emb.cold_token_ids
+
+            self.token_emb.hot_emb.weight.copy_(full_weight[hot_ids])
+
+            cold_full = full_weight[cold_ids].float()
+            U, S, Vh = torch.linalg.svd(cold_full, full_matrices=False)
+            rank = min(self.cold_latent_dim, S.numel())
+            U_r = U[:, :rank]
+            S_r = S[:rank]
+            Vh_r = Vh[:rank, :]
+            cold_u = U_r * S_r.unsqueeze(0)
+
+            self.token_emb.cold_emb_u.weight.zero_()
+            self.token_emb.cold_emb_u.weight[:, :rank].copy_(
+                cold_u.to(self.token_emb.cold_emb_u.weight.dtype)
+            )
+
+            self.token_emb.cold_latent_to_model.weight.zero_()
+            self.token_emb.cold_latent_to_model.weight[:, :rank].copy_(
+                Vh_r.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
+            )
+
+            self.full_token_emb.weight.requires_grad_(False)
+            self.uses_hotcold_flag.fill_(True)
+
+    def forward(self, input_ids, attention_mask=None):
+        B, T = input_ids.shape
+        device = input_ids.device
+        if bool(self.uses_hotcold_flag.item()):
+            x = self.token_emb(input_ids)
+        else:
+            x = self.full_token_emb(input_ids)
+        x = self.dropout(x)
+
+        positions = torch.arange(0, T, dtype=torch.long, device=device)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=device, dtype=torch.bool), diagonal=1
+        )
+        for layer in self.layers:
+            x = layer(x, causal_mask, attention_mask, self.rope, positions)
+
+        x = self.ln_f(x)
+        if bool(self.uses_hotcold_flag.item()):
+            return self.token_emb.logits(x)
+        return F.linear(x, self.full_token_emb.weight)
+
+    def token_partition_masks(self, token_ids: torch.Tensor):
+        hot_mask = self.token_emb.token_is_hot(token_ids)
+        cold_mask = ~hot_mask
+        return hot_mask, cold_mask
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+
+        dc = self.kv_lora_rank
+        dcp = self.q_lora_rank
+        d_nope = self.qk_nope_head_dim
+        d_rope = self.qk_rope_head_dim
+        d_v = self.v_head_dim
+        if not bool(self.uses_hotcold_flag.item()):
+            lm_head_bytes = V * d * wb
+            if self.weight_tied and not count_reuse:
+                embedding_bytes = 0
+            else:
+                embedding_bytes = d * wb
+        else:
+            r = self.cold_latent_dim
+            n_hot = self.token_emb.num_hot_tokens
+            n_cold = self.token_emb.num_cold_tokens
+            lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+            if self.weight_tied and not count_reuse:
+                embedding_bytes = 0
+            else:
+                embedding_bytes = max(d, r + d * r) * wb
+
+        attn_q_bytes = L * (
+            d * dcp
+            + dcp * (h * d_nope)
+            + dcp * (h * d_rope)
+        ) * wb
+        attn_k_bytes = L * (
+            d * dc
+            + dc * (h * d_nope)
+            + d * d_rope
+        ) * wb
+        attn_v_bytes = L * (dc * (h * d_v)) * wb
+        attn_o_bytes = L * (h * d_v) * d * wb
+
+        ffn_bytes = L * (
+            d * self.d_ff
+            + self.d_ff * d
+            + d * self.d_ff
+        ) * wb
+        norm_bytes = (2 * L + 1) * 2 * d * wb
+
+        kv_cache_token_width = dc + d_rope
+        kv_cache_read_bytes = kv_cache_token_width * seq_len * L * kb
+        kv_cache_write_bytes = kv_cache_token_width * L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="hotcold_mla",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"phase={'hotcold' if bool(self.uses_hotcold_flag.item()) else 'dense'}; "
+                f"MLA dc={dc}, dcp={dcp}, qk_nope={d_nope}, qk_rope={d_rope}, "
+                f"v_head_dim={d_v}; hot={self.token_emb.num_hot_tokens}, "
+                f"cold={self.token_emb.num_cold_tokens}, cold_rank={self.cold_latent_dim}"
+            ),
+        )
+
+
 class LoopTop4x3AttnResTransformer(SimpleTransformer):
     """Loop top 4 layers for 3 passes + inter-block attention residuals."""
 
@@ -1329,8 +2129,20 @@ def create_model(variant: str = "baseline", **kwargs):
         "qk_rope_head_dim",
         "v_head_dim",
     }
-    if variant != "mla":
+    hotcold_only_keys = {
+        "hot_token_k",
+        "cold_latent_dim",
+        "hot_token_cache_path",
+    }
+    twostage_only_keys = {
+        "svd_switch_fraction",
+    }
+    if variant not in {"mla", "hotcold_mla"}:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_only_keys}
+    if variant not in {"hotcold_svd", "twostage_svd", "hotcold_mla"}:
+        kwargs = {k: v for k, v in kwargs.items() if k not in hotcold_only_keys}
+    if variant not in {"twostage_svd", "hotcold_mla"}:
+        kwargs = {k: v for k, v in kwargs.items() if k not in twostage_only_keys}
 
     if variant == "gqa_only":
         return GQAOnlyTransformer(**kwargs)
@@ -1340,6 +2152,12 @@ def create_model(variant: str = "baseline", **kwargs):
         return BaselinePlusTransformer(**kwargs)
     elif variant == "mla":
         return MLATransformer(**kwargs)
+    elif variant == "hotcold_mla":
+        return HotColdMLATransformer(**kwargs)
+    elif variant == "hotcold_svd":
+        return HotColdSVDTransformer(**kwargs)
+    elif variant == "twostage_svd":
+        return TwoStageSVDTransformer(**kwargs)
     elif variant == "loop_top4x3_attnres":
         return LoopTop4x3AttnResTransformer(**kwargs)
     else:
@@ -1349,11 +2167,25 @@ def create_model(variant: str = "baseline", **kwargs):
 if __name__ == "__main__":
     from metric import print_profile
 
-    for variant in ["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "loop_top4x3_attnres"]:
+    for variant in [
+        "baseline",
+        "gqa_only",
+        "topk_only",
+        "baseline_plus",
+        "mla",
+        "hotcold_mla",
+        "hotcold_svd",
+        "twostage_svd",
+        "loop_top4x3_attnres",
+    ]:
         print(f"\n{'='*60}")
         print(f"  {variant}")
         print(f"{'='*60}")
-        model = create_model(variant=variant)
+        try:
+            model = create_model(variant=variant)
+        except FileNotFoundError as e:
+            print(f"  Skipping {variant}: {e}")
+            continue
         total_params = model.count_parameters(count_zeros=True)
         nonzero_params = model.count_parameters(count_zeros=False)
         print(f"  Total parameters:    {total_params:,}")

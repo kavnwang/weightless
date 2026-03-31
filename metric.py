@@ -374,7 +374,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Compute bytes_per_token_infer for a model")
-    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla"],
+    parser.add_argument("--model", type=str, default="baseline", choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "loop_top4x3_attnres"],
                         help="Model variant to profile")
     parser.add_argument("--seq_len", type=int, default=512, help="Context length for KV cache")
     parser.add_argument("--d_model", type=int, default=None)
@@ -386,6 +386,10 @@ if __name__ == "__main__":
     parser.add_argument("--qk_nope_head_dim", type=int, default=None)
     parser.add_argument("--qk_rope_head_dim", type=int, default=None)
     parser.add_argument("--v_head_dim", type=int, default=None)
+    parser.add_argument("--hot_token_k", type=int, default=None)
+    parser.add_argument("--cold_latent_dim", type=int, default=None)
+    parser.add_argument("--hot_token_cache_path", type=str, default=None)
+    parser.add_argument("--svd_switch_fraction", type=float, default=None)
     args = parser.parse_args()
 
     from model import create_model
@@ -409,6 +413,14 @@ if __name__ == "__main__":
         kwargs["qk_rope_head_dim"] = args.qk_rope_head_dim
     if args.v_head_dim is not None:
         kwargs["v_head_dim"] = args.v_head_dim
+    if args.hot_token_k is not None:
+        kwargs["hot_token_k"] = args.hot_token_k
+    if args.cold_latent_dim is not None:
+        kwargs["cold_latent_dim"] = args.cold_latent_dim
+    if args.hot_token_cache_path is not None:
+        kwargs["hot_token_cache_path"] = args.hot_token_cache_path
+    if args.svd_switch_fraction is not None:
+        kwargs["svd_switch_fraction"] = args.svd_switch_fraction
 
     model = create_model(variant=args.model, **kwargs)
 

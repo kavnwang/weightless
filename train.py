@@ -57,24 +57,56 @@ def get_rank(use_ddp: bool = False):
     return dist.get_rank()
 
 
+def unwrap_model(model):
+    raw = model.module if hasattr(model, "module") else model
+    if hasattr(raw, "_orig_mod"):
+        raw = raw._orig_mod
+    return raw
+
+
 # ---------------------------------------------------------------------------
 # Training helpers
 # ---------------------------------------------------------------------------
 
 def compute_loss(model, batch, device):
-    """Compute cross-entropy loss for a batch using BF16 autocast."""
+    """Compute total/hot/cold cross-entropy losses for a batch."""
     input_ids = batch["input_ids"].to(device)
     labels = batch["labels"].to(device)
     attention_mask = batch["attention_mask"].to(device)
-    
+
     with torch.autocast("cuda", dtype=torch.bfloat16):
         logits = model(input_ids, attention_mask)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            ignore_index=PAD_TOKEN_ID,
+        flat_logits = logits.reshape(-1, logits.size(-1))
+        flat_labels = labels.reshape(-1)
+        valid_mask = (attention_mask.reshape(-1) > 0) & (flat_labels != PAD_TOKEN_ID)
+        token_losses = F.cross_entropy(
+            flat_logits,
+            flat_labels,
+            reduction="none",
         )
-    return loss
+
+    if valid_mask.any():
+        total_loss = token_losses[valid_mask].mean()
+    else:
+        total_loss = token_losses.mean()
+
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "_orig_mod"):
+        raw_model = raw_model._orig_mod
+
+    hot_loss = None
+    cold_loss = None
+    if hasattr(raw_model, "token_partition_masks"):
+        hot_mask, cold_mask = raw_model.token_partition_masks(labels)
+        if hot_mask is not None and cold_mask is not None:
+            hot_mask = hot_mask.reshape(-1) & valid_mask
+            cold_mask = cold_mask.reshape(-1) & valid_mask
+            if hot_mask.any():
+                hot_loss = token_losses[hot_mask].mean()
+            if cold_mask.any():
+                cold_loss = token_losses[cold_mask].mean()
+
+    return total_loss, hot_loss, cold_loss
 
 
 def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float) -> float:
@@ -98,17 +130,31 @@ def evaluate(model, val_loader, device, max_batches: int = 20):
     """Evaluate model on validation set (lightweight, uses BF16)."""
     model.eval()
     total_loss = 0.0
+    total_hot_loss = 0.0
+    total_cold_loss = 0.0
     n_batches = 0
+    n_hot_batches = 0
+    n_cold_batches = 0
     
     for batch in val_loader:
-        loss = compute_loss(model, batch, device)
+        loss, hot_loss, cold_loss = compute_loss(model, batch, device)
         total_loss += loss.item()
+        if hot_loss is not None:
+            total_hot_loss += hot_loss.item()
+            n_hot_batches += 1
+        if cold_loss is not None:
+            total_cold_loss += cold_loss.item()
+            n_cold_batches += 1
         n_batches += 1
         if n_batches >= max_batches:
             break
     
     model.train()
-    return total_loss / n_batches
+    return {
+        "loss": total_loss / n_batches,
+        "hot_loss": (total_hot_loss / n_hot_batches) if n_hot_batches > 0 else None,
+        "cold_loss": (total_cold_loss / n_cold_batches) if n_cold_batches > 0 else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -132,19 +178,36 @@ def train(
 ):
     """Main training loop with logging every eval_every steps."""
     model.train()
-    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = unwrap_model(model)
     num_params = raw_model.count_parameters(count_zeros=True)
     min_lr = max_lr * 0.1
 
     train_iter = iter(train_loader)
     running_loss = 0.0
+    running_hot_loss = 0.0
+    running_cold_loss = 0.0
     total_tokens = 0
     epoch = 0
     t0 = time.time()
     world_size = get_world_size(use_ddp)
+    switched_to_svd = False
+    svd_switch_step = None
+    if hasattr(raw_model, "convert_full_to_hotcold_svd"):
+        switch_frac = float(getattr(raw_model, "svd_switch_fraction", 0.5))
+        switch_frac = min(max(switch_frac, 0.0), 1.0)
+        svd_switch_step = min(num_steps - 1, max(0, int(num_steps * switch_frac)))
+
+    hot_batches = 0
+    cold_batches = 0
 
     pbar = tqdm(range(num_steps), desc="Training", disable=not is_main(use_ddp))
     for step in pbar:
+        if (not switched_to_svd) and svd_switch_step is not None and step >= svd_switch_step:
+            raw_model.convert_full_to_hotcold_svd()
+            switched_to_svd = True
+            if is_main(use_ddp):
+                print(f"\n  Switched embedding regime at step {step}: dense -> hot/cold SVD")
+
         if hold_min_after_first_epoch and first_epoch_steps is not None:
             schedule_steps = max(1, min(num_steps, first_epoch_steps))
             if step >= schedule_steps:
@@ -168,11 +231,17 @@ def train(
         total_tokens += tokens_this_step
 
         optimizer.zero_grad()
-        loss = compute_loss(model, batch, device)
+        loss, hot_loss, cold_loss = compute_loss(model, batch, device)
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item()
+        if hot_loss is not None:
+            running_hot_loss += hot_loss.item()
+            hot_batches += 1
+        if cold_loss is not None:
+            running_cold_loss += cold_loss.item()
+            cold_batches += 1
 
         if (step + 1) % eval_every == 0:
             torch.cuda.synchronize()
@@ -182,14 +251,27 @@ def train(
 
             total_flops = 6 * num_params * total_tokens
             train_loss = running_loss / eval_every
-            val_loss = evaluate(model, val_loader, device)
+            train_hot_loss = (running_hot_loss / hot_batches) if hot_batches > 0 else None
+            train_cold_loss = (running_cold_loss / cold_batches) if cold_batches > 0 else None
+            val_metrics = evaluate(model, val_loader, device)
+            val_loss = val_metrics["loss"]
+            raw_model = unwrap_model(model)
             nonzero_params = raw_model.count_parameters(count_zeros=False)
 
             if is_main(use_ddp):
-                pbar.set_postfix({"train": f"{train_loss:.3f}", "val": f"{val_loss:.3f}", "mfu": f"{mfu:.1%}"})
+                postfix = {"train": f"{train_loss:.3f}", "val": f"{val_loss:.3f}", "mfu": f"{mfu:.1%}"}
+                if train_hot_loss is not None:
+                    postfix["train_hot"] = f"{train_hot_loss:.3f}"
+                if train_cold_loss is not None:
+                    postfix["train_cold"] = f"{train_cold_loss:.3f}"
+                if val_metrics["hot_loss"] is not None:
+                    postfix["val_hot"] = f"{val_metrics['hot_loss']:.3f}"
+                if val_metrics["cold_loss"] is not None:
+                    postfix["val_cold"] = f"{val_metrics['cold_loss']:.3f}"
+                pbar.set_postfix(postfix)
                 if use_wandb:
                     import wandb
-                    wandb.log({
+                    log_payload = {
                         "train/loss": train_loss,
                         "train/lr": lr,
                         "train/total_tokens": total_tokens,
@@ -199,11 +281,24 @@ def train(
                         "params/nonzero": nonzero_params,
                         "mfu": mfu,
                         "step": step + 1,
-                    })
+                    }
+                    if train_hot_loss is not None:
+                        log_payload["train/hot_loss"] = train_hot_loss
+                    if train_cold_loss is not None:
+                        log_payload["train/cold_loss"] = train_cold_loss
+                    if val_metrics["hot_loss"] is not None:
+                        log_payload["val/hot_loss"] = val_metrics["hot_loss"]
+                    if val_metrics["cold_loss"] is not None:
+                        log_payload["val/cold_loss"] = val_metrics["cold_loss"]
+                    wandb.log(log_payload)
                 if val_loss < GOAL_VAL_LOSS:
                     print(f"\n  Goal achieved! val_loss={val_loss:.4f} < {GOAL_VAL_LOSS} with {nonzero_params:,} non-zero params")
 
             running_loss = 0.0
+            running_hot_loss = 0.0
+            running_cold_loss = 0.0
+            hot_batches = 0
+            cold_batches = 0
             t0 = time.time()
 
     return model
@@ -233,18 +328,26 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "loop_top4x3_attnres"],
-                        help="Model variant: baseline, gqa_only, topk_only, baseline_plus, mla, or loop_top4x3_attnres")
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "loop_top4x3_attnres"],
+                        help="Model variant")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
-                        help="MLA KV latent rank (d_c); only used for --model mla")
+                        help="MLA KV latent rank (d_c); used for --model mla/hotcold_mla")
     parser.add_argument("--q_lora_rank", type=int, default=None,
-                        help="MLA query latent rank (d'_c); only used for --model mla")
+                        help="MLA query latent rank (d'_c); used for --model mla/hotcold_mla")
     parser.add_argument("--qk_nope_head_dim", type=int, default=None,
-                        help="MLA non-RoPE per-head Q/K dim; only used for --model mla")
+                        help="MLA non-RoPE per-head Q/K dim; used for --model mla/hotcold_mla")
     parser.add_argument("--qk_rope_head_dim", type=int, default=None,
-                        help="MLA RoPE per-head Q/K dim (must be even); only used for --model mla")
+                        help="MLA RoPE per-head Q/K dim (must be even); used for --model mla/hotcold_mla")
     parser.add_argument("--v_head_dim", type=int, default=None,
-                        help="MLA per-head V dim; only used for --model mla")
+                        help="MLA per-head V dim; used for --model mla/hotcold_mla")
+    parser.add_argument("--hot_token_k", type=int, default=2000,
+                        help="Number of dense hot tokens; used for --model hotcold_svd/hotcold_mla/twostage_svd")
+    parser.add_argument("--cold_latent_dim", type=int, default=128,
+                        help="Rank for cold-token SVD factors; used for --model hotcold_svd/hotcold_mla/twostage_svd")
+    parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
+                        help="Path to cached hot tokens from build_hot_token_cache.py")
+    parser.add_argument("--svd_switch_fraction", type=float, default=0.5,
+                        help="For twostage_svd/hotcold_mla: fraction of total steps before switching dense -> hot/cold SVD")
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--wandb_entity", type=str, default="kavn",
                         help="W&B workspace/entity to log runs to")
@@ -340,18 +443,26 @@ def main():
         qk_nope_head_dim=args.qk_nope_head_dim,
         qk_rope_head_dim=args.qk_rope_head_dim,
         v_head_dim=args.v_head_dim,
+        hot_token_k=args.hot_token_k,
+        cold_latent_dim=args.cold_latent_dim,
+        hot_token_cache_path=args.hot_token_cache_path,
+        svd_switch_fraction=args.svd_switch_fraction,
     )
     model.to(device)
     model = torch.compile(model)
 
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[local_rank])
+        ddp_find_unused = args.model in {"twostage_svd", "hotcold_mla"}
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            find_unused_parameters=ddp_find_unused,
+        )
+        if is_main(use_ddp) and ddp_find_unused:
+            print("  DDP: find_unused_parameters=True (required for two-stage dense->SVD switch)")
 
-    raw_model = model.module if hasattr(model, "module") else model
-    # Handle torch.compile wrapper
-    if hasattr(raw_model, "_orig_mod"):
-        raw_model = raw_model._orig_mod
+    raw_model = unwrap_model(model)
 
     total_params = raw_model.count_parameters(count_zeros=True)
     nonzero_params = raw_model.count_parameters(count_zeros=False)
@@ -402,15 +513,18 @@ def main():
 
     # End-of-training summary
     if is_main(use_ddp):
-        raw_model_final = model.module if hasattr(model, "module") else model
-        if hasattr(raw_model_final, "_orig_mod"):
-            raw_model_final = raw_model_final._orig_mod
-        final_val_loss = evaluate(model, val_loader, device)
+        raw_model_final = unwrap_model(model)
+        final_val_metrics = evaluate(model, val_loader, device)
+        final_val_loss = final_val_metrics["loss"]
         profile = raw_model_final.get_inference_profile()
         print("\n" + "=" * 60)
         print("  TRAINING COMPLETE")
         print("=" * 60)
         print(f"  Final val_loss:         {final_val_loss:.4f}  (target < {GOAL_VAL_LOSS})")
+        if final_val_metrics["hot_loss"] is not None:
+            print(f"  Final val_hot_loss:     {final_val_metrics['hot_loss']:.4f}")
+        if final_val_metrics["cold_loss"] is not None:
+            print(f"  Final val_cold_loss:    {final_val_metrics['cold_loss']:.4f}")
         print(f"  bytes_per_token_infer:  {profile.total_bytes:,} bytes")
         print_profile(profile)
         if final_val_loss < GOAL_VAL_LOSS:

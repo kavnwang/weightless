@@ -77,6 +77,10 @@ python train.py --model topk_only
 python train.py --model baseline_plus
 python train.py --model mla
 python train.py --model mla --kv_lora_rank 96 --q_lora_rank 96 --qk_rope_head_dim 48
+python train.py --model hotcold_mla --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt --svd_switch_fraction 0.5
+python build_hot_token_cache.py  # cached top-2000 hot tokens from 2% of 1.3B train split
+python train.py --model hotcold_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
+python train.py --model twostage_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt --svd_switch_fraction 0.5
 
 # Custom config
 python train.py --batch_size 64 --max_lr 8e-4 --num_steps 30000 --d_model 768 --n_layers 8
@@ -120,6 +124,9 @@ python metric.py --model gqa_only --seq_len 1024
 python metric.py --model topk_only --seq_len 1024
 python metric.py --model baseline_plus --seq_len 1024
 python metric.py --model mla --seq_len 1024
+python metric.py --model hotcold_mla --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
+python metric.py --model hotcold_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
+python metric.py --model twostage_svd --hot_token_cache_path cache/hot_tokens_train1p3b_top2000.pt
 ```
 
 ## Baselines
@@ -133,6 +140,9 @@ Five model variants are provided:
 | `topk_only` | FFN sparsity ablation | Depends on `ffn_top_k` | Full MHA, top-k activation sparsity in FFN |
 | `baseline_plus` | GQA + top-k FFN | **153 MB** (-21%) | Fewer KV heads, activation sparsity in FFN |
 | `mla` | DeepSeek-style latent attention | Depends on MLA dims | Low-rank Q/KV compression and reduced KV cache payload |
+| `hotcold_mla` | MLA + hot/cold vocab SVD | Depends on MLA + rank | MLA attention plus hot dense and cold low-rank vocab factors |
+| `hotcold_svd` | Hot dense + cold SVD vocab | Depends on hot_k/rank | Top-2000 tokens dense, cold tokens rank-128 factors (tied embed/unembed) |
+| `twostage_svd` | Dense then SVD switch | Phase-dependent | Train dense for first half, then convert to hot/cold SVD and continue |
 
 The `baseline` is your starting point. `gqa_only` and `topk_only` are ablations that isolate each optimization in `baseline_plus`, while `mla` is an alternative attention architecture. Run `python visualize.py` to compare per-component effects.
 

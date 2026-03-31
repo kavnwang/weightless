@@ -6,6 +6,8 @@ from huggingface_hub import HfFileSystem
 
 DATASET_REPO = "kushalt/fineweb-edu-gpt2"
 SUBSET = "sample-10BT_max_length_513"
+TRAIN_SPLIT_1P3B = "train"
+TEST_SPLIT_1P3B = "test"
 
 
 def get_parquet_files(split: str = "train"):
@@ -61,7 +63,7 @@ def collate_fn(batch):
 
 
 def get_dataloader(
-    split: str = "train",
+    split: str = TRAIN_SPLIT_1P3B,
     batch_size: int = 32,
     streaming: bool = True,
     num_workers: int = 0,
