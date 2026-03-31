@@ -380,9 +380,6 @@ def main():
     if args.model in {"mla_hybrid_loop12", "mla_hybrid_loop12_monarch"} and args.n_layers == 8:
         # Keep CLI ergonomic: these variants are fixed to 12 layers.
         args.n_layers = 12
-    if args.model == "mla_hybrid_loop12_monarch" and args.d_model == 768:
-        # New monarch-only hybrid defaults to d_model=1024.
-        args.d_model = 1024
     if args.model == "mla_hybrid_loop12_monarch" and args.d_ff == 2048:
         # Monarch FFN path in this variant is square: d_ff must match d_model.
         args.d_ff = args.d_model
