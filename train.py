@@ -258,7 +258,7 @@ def train(
     model.train()
     raw_model = unwrap_model(model)
     num_params = raw_model.count_parameters(count_zeros=True)
-    min_lr = max_lr * 0.2
+    min_lr = max_lr * 0.1
 
     train_iter = iter(train_loader)
     running_loss = 0.0

@@ -4972,33 +4972,33 @@ class MLAHybridLoop12MonarchAttnSVDFfnBinaryDPTransformer(MLAHybridLoop12Monarch
 
 
 class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVDFfnTransformer):
-    """12-layer MLA hybrid loop with Monarch attention and switchable LoRA FFNs."""
+    """12-layer MLA hybrid loop with Top-K loop FFNs and no LoRA adapters."""
 
     def __init__(
         self,
         *args,
+        loop_ffn_top_k: int | None = None,
         lora_ffn_rank: int | None = None,
         lora_ffn_alpha: float = 1.0,
         **kwargs,
     ):
-        # LoRA schedule: activate adapters at 30% by default.
+        # Keep this variant on the shorter warmup/switch schedule.
         if "svd_switch_fraction" not in kwargs:
             kwargs["svd_switch_fraction"] = 0.3
-        if lora_ffn_rank is None:
-            lora_ffn_rank = kwargs.pop("svd_ffn_rank", None)
-        kwargs.pop("svd_ffn_rank", None)
-        super().__init__(*args, svd_ffn_rank=lora_ffn_rank, **kwargs)
-        self.lora_ffn_rank = lora_ffn_rank if lora_ffn_rank is not None else 96
+        super().__init__(*args, **kwargs)
+        self.loop_ffn_top_k = loop_ffn_top_k if loop_ffn_top_k is not None else self.d_ff // 4
+        # LoRA knobs are accepted for backward CLI compatibility but unused.
+        self.lora_ffn_rank = lora_ffn_rank
         self.lora_ffn_alpha = float(lora_ffn_alpha)
-        # Architecture requested by user:
+        # Architecture:
         # - memory layers: 1,3,5,7
-        # - one shared dense FFN base across layers: 0,2,4,6
-        # - pair-shared dense FFN bases for: (8,9), (10,11)
-        # - per-layer LoRA on every non-memory layer
+        # - bottom dense SwiGLU tied across layers: 0,2,4,6
+        # - terminal dense SwiGLU: 11
+        # - looped top-k dense SwiGLU: 8,9,10
         self.bottom_even_memory_layers = [1, 3, 5, 7]
-        self.lora_ffn_layers = [0, 2, 4, 6, 8, 9, 10, 11]
-        shared_group = [0, 2, 4, 6]
-        shared_pairs = [(8, 9), (10, 11)]
+        self.bottom_tied_ffn_layers = [0, 2, 4, 6]
+        self.loop_topk_ffn_layers = [8, 9, 10]
+        self.loop_dense_ffn_layers = [11]
 
         shared_value_store = (
             ProductKeyValueStore(self.mem_n_keys, self.mem_v_dim)
@@ -5021,43 +5021,25 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
             else:
                 self.layers[i].memory_layer = None
 
-        # Single dense base shared by all low non-memory layers.
-        group_dense = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
-        for i in shared_group:
-            ff_i = LoRASwiGLUFF(
-                d_model=self.d_model,
-                d_ff=self.d_ff,
-                lora_rank=self.lora_ffn_rank,
-                lora_alpha=self.lora_ffn_alpha,
-            )
-            ff_i.w1.base = group_dense.w1
-            ff_i.w2.base = group_dense.w2
-            ff_i.w3.base = group_dense.w3
-            self.layers[i].ff = ff_i
-
-        for a, b in shared_pairs:
-            shared_dense = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
-            ff_a = LoRASwiGLUFF(
-                d_model=self.d_model,
-                d_ff=self.d_ff,
-                lora_rank=self.lora_ffn_rank,
-                lora_alpha=self.lora_ffn_alpha,
-            )
-            ff_b = LoRASwiGLUFF(
-                d_model=self.d_model,
-                d_ff=self.d_ff,
-                lora_rank=self.lora_ffn_rank,
-                lora_alpha=self.lora_ffn_alpha,
-            )
-            # Pair-shared dense base; per-layer LoRA adapters remain independent.
-            ff_a.w1.base = shared_dense.w1
-            ff_a.w2.base = shared_dense.w2
-            ff_a.w3.base = shared_dense.w3
-            ff_b.w1.base = shared_dense.w1
-            ff_b.w2.base = shared_dense.w2
-            ff_b.w3.base = shared_dense.w3
-            self.layers[a].ff = ff_a
-            self.layers[b].ff = ff_b
+        # Tie a single dense SwiGLU base across bottom non-memory layers.
+        bottom_shared_dense = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
+        for i in range(self.n_layers):
+            if i in self.bottom_even_memory_layers:
+                continue
+            if i in self.bottom_tied_ffn_layers:
+                ff_i = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
+                ff_i.w1 = bottom_shared_dense.w1
+                ff_i.w2 = bottom_shared_dense.w2
+                ff_i.w3 = bottom_shared_dense.w3
+                self.layers[i].ff = ff_i
+            elif i in self.loop_topk_ffn_layers:
+                self.layers[i].ff = TopKSwiGLUFF(
+                    d_model=self.d_model,
+                    d_ff=self.d_ff,
+                    top_k=self.loop_ffn_top_k,
+                )
+            else:
+                self.layers[i].ff = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
 
     def _convert_embedding_to_hotcold(self):
         if bool(self.uses_hotcold_flag.item()):
@@ -5068,7 +5050,7 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
             cold_ids = self.token_emb.cold_token_ids
             self.token_emb.hot_emb.weight.copy_(full_weight[hot_ids])
 
-            # LoRA path: initialize as cold low-dim embedding -> single linear to d_model.
+            # Initialize as cold low-dim embedding -> single linear to d_model.
             # Hot tokens stay full-dim with no extra projection.
             cold_full = full_weight[cold_ids].float()
             r = self.token_emb.cold_emb_u.weight.shape[1]
@@ -5133,11 +5115,11 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
 
         attn_o_numel = 0
         ffn_numel = 0
-        seen_ffn_ptrs: set[int] | None = set() if count_reuse else None
+        # Tied/shared FFN weights are a single physical parameter set and
+        # must only be counted once, regardless of count_reuse.
+        seen_ffn_ptrs: set[int] = set()
 
         def _accum_ffn_param(param: torch.Tensor) -> int:
-            if seen_ffn_ptrs is None:
-                return int(param.numel())
             ptr = int(param.data_ptr())
             if ptr in seen_ffn_ptrs:
                 return 0
@@ -5151,16 +5133,7 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
                 attn_o_numel += sum(p.numel() for p in proj.parameters())
             if layer.memory_layer is not None:
                 continue
-            if isinstance(layer.ff, LoRASwiGLUFF):
-                # Under count_reuse=True, shared dense bases are counted once by pointer.
-                for lin in (layer.ff.w1, layer.ff.w2, layer.ff.w3):
-                    ffn_numel += _accum_ffn_param(lin.base.weight)
-                    if lin.base.bias is not None:
-                        ffn_numel += _accum_ffn_param(lin.base.bias)
-                    if bool(lin.uses_lora_flag.item()):
-                        ffn_numel += _accum_ffn_param(lin.lora_down.weight)
-                        ffn_numel += _accum_ffn_param(lin.lora_up.weight)
-            elif isinstance(layer.ff, SVDSwiGLUFF):
+            if isinstance(layer.ff, SVDSwiGLUFF):
                 # SVD FFN path has no intentional cross-layer sharing in this model.
                 ffn_numel += layer.ff.active_weight_numel()
             else:
@@ -5225,9 +5198,10 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
             unique_param_bytes=unique_numel * wb,
             unique_opt_state_bytes=unique_numel * 12,
             notes=(
-                f"phase={'hotcold+lora' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
+                f"phase={'hotcold' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
                 f"mem_layers={self.bottom_even_memory_layers}; "
-                f"lora_ffn={self.lora_ffn_layers}; rank={self.lora_ffn_rank}; alpha={self.lora_ffn_alpha}; "
+                f"bottom_tied_ffn={self.bottom_tied_ffn_layers}; "
+                f"loop_topk_ffn={self.loop_topk_ffn_layers}; top_k={self.loop_ffn_top_k}; "
                 f"dense_loop_ffn={self.loop_dense_ffn_layers}; "
                 f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
                 f"top4_loopx{self.loop_repeats}"
@@ -5291,9 +5265,11 @@ class MLAHybridLoop12MonarchAttnLoRAFfnBinaryDPTransformer(MLAHybridLoop12Monarc
         profile.ffn_bytes += (binary_memory_key_bytes - dense_memory_key_bytes)
         profile.model_name = "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp"
         profile.notes = (
-            f"phase={'hotcold+lora' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
+            f"phase={'hotcold' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
             f"mem_layers={self.bottom_even_memory_layers}; "
-            f"lora_ffn={self.lora_ffn_layers}; rank={self.lora_ffn_rank}; alpha={self.lora_ffn_alpha}; "
+            f"bottom_tied_ffn={self.bottom_tied_ffn_layers}; "
+            f"loop_topk_ffn={self.loop_topk_ffn_layers}; top_k={self.loop_ffn_top_k}; "
+            f"dense_loop_ffn={self.loop_dense_ffn_layers}; "
             f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
             f"binary_total_keys={self.mem_binary_total_keys}; "
             f"binary_buckets={self.mem_binary_buckets}; "

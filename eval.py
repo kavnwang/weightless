@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import torch
 import torch.nn.functional as F
@@ -24,12 +25,50 @@ from infinigram_sidecar import (
 GOAL_VAL_LOSS = 3.5
 
 
-@torch.no_grad()
-def evaluate(model, dataloader, device):
+def _autocast_context(device: torch.device):
+    # Some hybrid token-embedding paths perform indexed writes that require
+    # exact dtype matches; run eval in full precision for robustness.
+    return contextlib.nullcontext()
+
+
+def _token_losses_from_logits(model, logits, labels, attention_mask):
+    flat_output = logits.reshape(-1, logits.size(-1))
+    flat_labels = labels.reshape(-1)
+    if bool(getattr(model, "returns_log_probs", False)):
+        token_losses = F.nll_loss(flat_output, flat_labels, reduction="none")
+    else:
+        token_losses = F.cross_entropy(flat_output, flat_labels, reduction="none")
+    valid_mask = attention_mask.reshape(-1) > 0
+    return token_losses, valid_mask, flat_labels
+
+
+def evaluate(
+    model,
+    dataloader,
+    device,
+    ttt_steps: int = 0,
+    ttt_lr: float = 1e-5,
+    ttt_weight_decay: float = 0.0,
+    ttt_grad_clip: float = 1.0,
+    max_eval_batches: int | None = None,
+):
     """Evaluate model and return metrics."""
     model.eval()
     model.to(device)
-    
+
+    ttt_enabled = ttt_steps > 0
+    ttt_optimizer = None
+    if ttt_enabled:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise ValueError("TTT requested, but model has no trainable parameters.")
+        ttt_optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=ttt_lr,
+            weight_decay=ttt_weight_decay,
+            betas=(0.9, 0.95),
+        )
+
     total_loss = 0.0
     total_hot_loss = 0.0
     total_cold_loss = 0.0
@@ -37,23 +76,19 @@ def evaluate(model, dataloader, device):
     total_hot_tokens = 0
     total_cold_tokens = 0
     n_batches = 0
-    
+
     for batch in tqdm(dataloader, desc="Evaluating"):
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            logits = model(input_ids, attention_mask)
-        
-        flat_output = logits.reshape(-1, logits.size(-1))
-        flat_labels = labels.reshape(-1)
-        if bool(getattr(model, "returns_log_probs", False)):
-            token_losses = F.nll_loss(flat_output, flat_labels, reduction="none")
-        else:
-            token_losses = F.cross_entropy(flat_output, flat_labels, reduction="none")
 
-        valid_mask = attention_mask.reshape(-1) > 0
+        with torch.no_grad():
+            with _autocast_context(device):
+                logits = model(input_ids, attention_mask)
+
+        token_losses, valid_mask, flat_labels = _token_losses_from_logits(
+            model, logits, labels, attention_mask
+        )
         n_tokens = valid_mask.sum().item()
         total_loss += token_losses[valid_mask].sum().item()
         total_tokens += n_tokens
@@ -80,10 +115,32 @@ def evaluate(model, dataloader, device):
                     ).item()
                     total_cold_tokens += cold_mask.sum().item()
         n_batches += 1
-        
+
+        if ttt_enabled:
+            model.train()
+            for _ in range(ttt_steps):
+                ttt_optimizer.zero_grad(set_to_none=True)
+                with _autocast_context(device):
+                    ttt_logits = model(input_ids, attention_mask)
+                ttt_token_losses, ttt_valid_mask, _ = _token_losses_from_logits(
+                    model, ttt_logits, labels, attention_mask
+                )
+                if ttt_valid_mask.any():
+                    ttt_loss = ttt_token_losses[ttt_valid_mask].mean()
+                else:
+                    ttt_loss = ttt_token_losses.mean()
+                ttt_loss.backward()
+                if ttt_grad_clip is not None and ttt_grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=ttt_grad_clip)
+                ttt_optimizer.step()
+            model.eval()
+
+        if max_eval_batches is not None and n_batches >= max_eval_batches:
+            break
+
     avg_loss = total_loss / total_tokens
     perplexity = torch.exp(torch.tensor(avg_loss)).item()
-    
+
     # Parameters
     raw_model = model.module if hasattr(model, "module") else model
     if hasattr(raw_model, "_orig_mod"):
@@ -175,6 +232,11 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate model on FineWeb")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint (.pt file)")
+    parser.set_defaults(checkpoint_strict=True)
+    parser.add_argument("--checkpoint_strict", dest="checkpoint_strict", action="store_true",
+                        help="Require exact state_dict match when loading checkpoint (default: enabled)")
+    parser.add_argument("--no_checkpoint_strict", dest="checkpoint_strict", action="store_false",
+                        help="Allow partial state_dict loading for older/mismatched checkpoints")
     parser.add_argument("--checkpoint_config", type=str, default=None,
                         help="Optional JSON config for reconstructing checkpoint architecture")
     parser.add_argument("--batch_size", type=int, default=32)
@@ -229,6 +291,16 @@ def main():
     parser.add_argument("--sidecar_min_count", type=int, default=2)
     parser.add_argument("--sidecar_max_bytes_per_token", type=int, default=256)
     parser.add_argument("--sidecar_apply_to_all_positions", action="store_true")
+    parser.add_argument("--ttt_steps", type=int, default=0,
+                        help="Number of test-time training optimizer steps per eval batch")
+    parser.add_argument("--ttt_lr", type=float, default=1e-5,
+                        help="Learning rate for TTT optimizer")
+    parser.add_argument("--ttt_weight_decay", type=float, default=0.0,
+                        help="Weight decay for TTT optimizer")
+    parser.add_argument("--ttt_grad_clip", type=float, default=1.0,
+                        help="Gradient clipping max norm for TTT (<=0 disables clipping)")
+    parser.add_argument("--max_eval_batches", type=int, default=None,
+                        help="Optional cap on number of eval batches")
     args = parser.parse_args()
     _apply_checkpoint_config(args)
     if args.model in {
@@ -296,8 +368,13 @@ def main():
     
     if args.checkpoint is not None:
         state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=args.checkpoint_strict)
         print(f"  Loaded checkpoint: {args.checkpoint}")
+        if not args.checkpoint_strict:
+            print(
+                f"  Non-strict load: missing_keys={len(missing)}, "
+                f"unexpected_keys={len(unexpected)}"
+            )
     else:
         print("  WARNING: No checkpoint specified -- evaluating random-init model.")
         print("  Use --checkpoint model.pt to evaluate a trained model.")
@@ -307,6 +384,8 @@ def main():
 
     sidecar_wrapper = None
     if args.sidecar_dir:
+        if args.ttt_steps > 0:
+            raise ValueError("TTT is not supported together with sidecar fusion in eval.py")
         index = CompactNgramIndex(args.sidecar_dir)
         runtime_cfg = SidecarRuntimeConfig(
             min_order=args.sidecar_min_order,
@@ -332,7 +411,16 @@ def main():
     # Evaluate
     print("  Evaluating...")
     eval_model = sidecar_wrapper if sidecar_wrapper is not None else model
-    metrics = evaluate(eval_model, val_loader, device)
+    metrics = evaluate(
+        eval_model,
+        val_loader,
+        device,
+        ttt_steps=args.ttt_steps,
+        ttt_lr=args.ttt_lr,
+        ttt_weight_decay=args.ttt_weight_decay,
+        ttt_grad_clip=args.ttt_grad_clip,
+        max_eval_batches=args.max_eval_batches,
+    )
     
     # Print results
     print("\n" + "=" * 60)
