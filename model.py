@@ -1157,6 +1157,91 @@ class SVDSwiGLUFF(nn.Module):
         )
 
 
+class LoRALinear(nn.Module):
+    """Dense linear with switchable LoRA residual."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        rank: int,
+        alpha: float = 1.0,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if rank < 1:
+            raise ValueError(f"rank must be >= 1, got {rank}")
+        self.in_features = in_features
+        self.out_features = out_features
+        self.rank = min(rank, in_features, out_features)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+        self.base = nn.Linear(in_features, out_features, bias=bias)
+        self.lora_down = nn.Linear(in_features, self.rank, bias=False)
+        self.lora_up = nn.Linear(self.rank, out_features, bias=False)
+        self.register_buffer("uses_lora_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.lora_down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.base(x)
+        if bool(self.uses_lora_flag.item()):
+            out = out + self.scaling * self.lora_up(self.lora_down(x))
+        return out
+
+    def enable_lora(self):
+        self.uses_lora_flag.fill_(True)
+
+    def active_weight_numel(self) -> int:
+        n = self.base.weight.numel()
+        if self.base.bias is not None:
+            n += self.base.bias.numel()
+        if bool(self.uses_lora_flag.item()):
+            n += self.lora_down.weight.numel() + self.lora_up.weight.numel()
+        return n
+
+    # Kept so existing layer.convert_full_to_svd() call-sites can drive phase switch.
+    def convert_full_to_svd(self):
+        self.enable_lora()
+
+
+class LoRASwiGLUFF(nn.Module):
+    """SwiGLU FFN with switchable LoRA residuals on all three projections."""
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        lora_rank: int,
+        lora_alpha: float = 1.0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.lora_rank = lora_rank
+        self.w1 = LoRALinear(d_model, d_ff, rank=lora_rank, alpha=lora_alpha, bias=False)
+        self.w2 = LoRALinear(d_ff, d_model, rank=lora_rank, alpha=lora_alpha, bias=False)
+        self.w3 = LoRALinear(d_model, d_ff, rank=lora_rank, alpha=lora_alpha, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+    def convert_full_to_svd(self):
+        self.w1.enable_lora()
+        self.w2.enable_lora()
+        self.w3.enable_lora()
+
+    def active_weight_numel(self) -> int:
+        return (
+            self.w1.active_weight_numel()
+            + self.w2.active_weight_numel()
+            + self.w3.active_weight_numel()
+        )
+
+
 class MonarchSwiGLUFF(nn.Module):
     """SwiGLU FFN with Monarch-structured projections (requires d_ff == d_model)."""
 
@@ -4886,6 +4971,299 @@ class MLAHybridLoop12MonarchAttnSVDFfnBinaryDPTransformer(MLAHybridLoop12Monarch
         return profile
 
 
+class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVDFfnTransformer):
+    """12-layer MLA hybrid loop with Monarch attention and switchable LoRA FFNs."""
+
+    def __init__(
+        self,
+        *args,
+        lora_ffn_rank: int | None = None,
+        lora_ffn_alpha: float = 1.0,
+        **kwargs,
+    ):
+        # LoRA schedule: activate adapters at 30% by default.
+        if "svd_switch_fraction" not in kwargs:
+            kwargs["svd_switch_fraction"] = 0.3
+        if lora_ffn_rank is None:
+            lora_ffn_rank = kwargs.pop("svd_ffn_rank", None)
+        kwargs.pop("svd_ffn_rank", None)
+        super().__init__(*args, svd_ffn_rank=lora_ffn_rank, **kwargs)
+        self.lora_ffn_rank = lora_ffn_rank if lora_ffn_rank is not None else 96
+        self.lora_ffn_alpha = float(lora_ffn_alpha)
+        # Architecture requested by user:
+        # - memory layers: 1,3,5,7
+        # - shared dense FFN bases for pairs: (0,2), (4,6), (8,9), (10,11)
+        # - per-layer LoRA on every non-memory layer
+        self.bottom_even_memory_layers = [1, 3, 5, 7]
+        self.lora_ffn_layers = [0, 2, 4, 6, 8, 9, 10, 11]
+        shared_pairs = [(0, 2), (4, 6), (8, 9), (10, 11)]
+
+        shared_value_store = (
+            ProductKeyValueStore(self.mem_n_keys, self.mem_v_dim)
+            if self.mem_share_values else None
+        )
+        for i in range(self.n_layers):
+            if i in self.bottom_even_memory_layers:
+                self.layers[i].memory_layer = ProductKeyMemoryLayer(
+                    d_model=self.d_model,
+                    mem_n_keys=self.mem_n_keys,
+                    mem_heads=self.mem_heads,
+                    mem_knn=self.mem_knn,
+                    key_dim=self.mem_k_dim,
+                    value_dim=self.mem_v_dim,
+                    mem_q_rank=self.mem_q_rank,
+                    value_store=shared_value_store,
+                    memory_plus=False,
+                    qk_norm=self.qk_norm,
+                )
+            else:
+                self.layers[i].memory_layer = None
+
+        for a, b in shared_pairs:
+            shared_dense = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
+            ff_a = LoRASwiGLUFF(
+                d_model=self.d_model,
+                d_ff=self.d_ff,
+                lora_rank=self.lora_ffn_rank,
+                lora_alpha=self.lora_ffn_alpha,
+            )
+            ff_b = LoRASwiGLUFF(
+                d_model=self.d_model,
+                d_ff=self.d_ff,
+                lora_rank=self.lora_ffn_rank,
+                lora_alpha=self.lora_ffn_alpha,
+            )
+            # Pair-shared dense base; per-layer LoRA adapters remain independent.
+            ff_a.w1.base = shared_dense.w1
+            ff_a.w2.base = shared_dense.w2
+            ff_a.w3.base = shared_dense.w3
+            ff_b.w1.base = shared_dense.w1
+            ff_b.w2.base = shared_dense.w2
+            ff_b.w3.base = shared_dense.w3
+            self.layers[a].ff = ff_a
+            self.layers[b].ff = ff_b
+
+    def _convert_embedding_to_hotcold(self):
+        if bool(self.uses_hotcold_flag.item()):
+            return
+        with torch.no_grad():
+            full_weight = self.full_token_emb.weight.detach()
+            hot_ids = self.token_emb.hot_token_ids
+            cold_ids = self.token_emb.cold_token_ids
+            self.token_emb.hot_emb.weight.copy_(full_weight[hot_ids])
+
+            # LoRA path: initialize as cold low-dim embedding -> single linear to d_model.
+            # Hot tokens stay full-dim with no extra projection.
+            cold_full = full_weight[cold_ids].float()
+            r = self.token_emb.cold_emb_u.weight.shape[1]
+            cold_latent = cold_full[:, :r].contiguous()
+            self.token_emb.cold_emb_u.weight.copy_(
+                cold_latent.to(self.token_emb.cold_emb_u.weight.dtype)
+            )
+
+            # Fit projection W (Linear(r -> d_model)) by least squares:
+            # cold_latent @ W^T ≈ cold_full.
+            # This keeps init simple and avoids SVD-based decomposition.
+            ls = torch.linalg.lstsq(cold_latent, cold_full).solution  # [r, d_model]
+            self.token_emb.cold_latent_to_model.weight.copy_(
+                ls.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
+            )
+
+            self.full_token_emb.weight.requires_grad_(False)
+            self.uses_hotcold_flag.fill_(True)
+
+    def _convert_structured_layers_to_svd(self):
+        if bool(self.uses_structured_svd_flag.item()):
+            return
+        for layer in self.layers:
+            layer.convert_full_to_svd()
+        self.uses_structured_svd_flag.fill_(True)
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        d = self.d_model
+        h = self.n_heads
+        L = self.n_layers
+        V = self.vocab_size
+        wb = weight_dtype_bytes
+        kb = kv_dtype_bytes
+        dc = self.kv_lora_rank
+        dcp = self.q_lora_rank
+        d_nope = self.qk_nope_head_dim
+        d_rope = self.qk_rope_head_dim
+        d_v = self.v_head_dim
+        exec_counts = self._layer_exec_counts()
+        exec_L = sum(exec_counts)
+        M = len(self.bottom_even_memory_layers)
+
+        if bool(self.uses_hotcold_flag.item()):
+            r = self.cold_latent_dim
+            n_hot = self.token_emb.num_hot_tokens
+            n_cold = self.token_emb.num_cold_tokens
+            lm_head_bytes = (n_hot * d + d * r + n_cold * r) * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else max(d, r + d * r) * wb
+        else:
+            lm_head_bytes = V * d * wb
+            embedding_bytes = 0 if (self.weight_tied and not count_reuse) else d * wb
+
+        attn_q_bytes = L * (d * dcp + dcp * (h * d_nope) + dcp * (h * d_rope)) * wb
+        attn_k_bytes = L * (d * dc + dc * (h * d_nope) + d * d_rope) * wb
+        attn_v_bytes = L * (dc * (h * d_v)) * wb
+
+        attn_o_numel = 0
+        ffn_numel = 0
+        for layer in self.layers:
+            attn = getattr(layer, "attn", None)
+            proj = getattr(attn, "proj", None)
+            if proj is not None:
+                attn_o_numel += sum(p.numel() for p in proj.parameters())
+            if layer.memory_layer is not None:
+                continue
+            if isinstance(layer.ff, (SVDSwiGLUFF, LoRASwiGLUFF)):
+                ffn_numel += layer.ff.active_weight_numel()
+            else:
+                ffn_numel += sum(p.numel() for p in layer.ff.parameters())
+        attn_o_bytes = attn_o_numel * wb
+
+        dense_memory_query_bytes = M * (
+            d * self.mem_q_rank + self.mem_q_rank * (self.mem_heads * self.mem_k_dim)
+        ) * wb
+        dense_memory_key_bytes = M * (self.mem_heads * self.mem_n_keys * self.mem_k_dim) * wb
+        dense_memory_value_bytes = M * (self.mem_heads * self.mem_knn * self.mem_v_dim) * wb
+        dense_memory_proj_bytes = M * (self.mem_v_dim * d) * wb if self.mem_v_dim != d else 0
+        ffn_bytes = (
+            ffn_numel * wb
+            + dense_memory_query_bytes
+            + dense_memory_key_bytes
+            + dense_memory_value_bytes
+            + dense_memory_proj_bytes
+        )
+
+        norm_bytes = (
+            (2 * L + 1) * 2 * d * wb
+            + (2 * L) * d * wb
+            + (2 * L) * d * wb
+        )
+        kv_cache_token_width = dc + d_rope
+        kv_cache_read_bytes = kv_cache_token_width * seq_len * exec_L * kb
+        kv_cache_write_bytes = kv_cache_token_width * exec_L * kb
+
+        seen_ptrs: set[int] = set()
+        unique_numel = 0
+        for p in self.parameters():
+            ptr = p.data_ptr()
+            if ptr not in seen_ptrs:
+                seen_ptrs.add(ptr)
+                unique_numel += p.numel()
+
+        return InferenceProfile(
+            model_name="mla_hybrid_loop12_monarch_attn_lora_ffn",
+            d_model=d,
+            n_layers=L,
+            n_heads=h,
+            n_kv_heads=self.n_kv_heads,
+            head_dim=self.head_dim,
+            d_ff=self.d_ff,
+            vocab_size=V,
+            seq_len=seq_len,
+            weight_dtype_bytes=wb,
+            kv_dtype_bytes=kb,
+            count_reuse=count_reuse,
+            embedding_bytes=embedding_bytes,
+            attn_q_bytes=attn_q_bytes,
+            attn_k_bytes=attn_k_bytes,
+            attn_v_bytes=attn_v_bytes,
+            attn_o_bytes=attn_o_bytes,
+            ffn_bytes=ffn_bytes,
+            norm_bytes=norm_bytes,
+            lm_head_bytes=lm_head_bytes,
+            kv_cache_read_bytes=kv_cache_read_bytes,
+            kv_cache_write_bytes=kv_cache_write_bytes,
+            unique_param_bytes=unique_numel * wb,
+            unique_opt_state_bytes=unique_numel * 12,
+            notes=(
+                f"phase={'hotcold+lora' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
+                f"mem_layers={self.bottom_even_memory_layers}; "
+                f"lora_ffn={self.lora_ffn_layers}; rank={self.lora_ffn_rank}; alpha={self.lora_ffn_alpha}; "
+                f"dense_loop_ffn={self.loop_dense_ffn_layers}; "
+                f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
+                f"top4_loopx{self.loop_repeats}"
+            ),
+        )
+
+
+class MLAHybridLoop12MonarchAttnLoRAFfnBinaryDPTransformer(MLAHybridLoop12MonarchAttnLoRAFfnTransformer):
+    """Hybrid loop12 + Monarch attn + LoRA FFN, with binary-DP memory layers."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mem_binary_total_keys = self.mem_n_keys * self.mem_n_keys
+        self.mem_binary_buckets = int(math.log2(self.mem_binary_total_keys))
+        if (1 << self.mem_binary_buckets) != self.mem_binary_total_keys:
+            raise ValueError(
+                "Binary memory requires mem_n_keys^2 to be power-of-two. "
+                f"Got mem_n_keys={self.mem_n_keys} => total_keys={self.mem_binary_total_keys}."
+            )
+        if self.mem_k_dim % self.mem_binary_buckets != 0:
+            raise ValueError(
+                f"mem_k_dim must be divisible by num_binary_buckets={self.mem_binary_buckets}; "
+                f"got mem_k_dim={self.mem_k_dim}."
+            )
+
+        shared_value_store = (
+            BinaryCodeValueStore(self.mem_binary_total_keys, self.mem_v_dim)
+            if self.mem_share_values else None
+        )
+        for i in self.bottom_even_memory_layers:
+            self.layers[i].memory_layer = BinaryProductCodeMemoryLayer(
+                d_model=self.d_model,
+                mem_n_keys=self.mem_n_keys,
+                mem_heads=self.mem_heads,
+                mem_knn=self.mem_knn,
+                key_dim=self.mem_k_dim,
+                value_dim=self.mem_v_dim,
+                mem_q_rank=self.mem_q_rank,
+                value_store=shared_value_store,
+                memory_plus=False,
+                qk_norm=self.qk_norm,
+            )
+
+    def get_inference_profile(
+        self,
+        seq_len: int = 512,
+        weight_dtype_bytes: float = 2,
+        kv_dtype_bytes: float = 2,
+        count_reuse: bool = False,
+    ) -> InferenceProfile:
+        profile = super().get_inference_profile(
+            seq_len=seq_len,
+            weight_dtype_bytes=weight_dtype_bytes,
+            kv_dtype_bytes=kv_dtype_bytes,
+            count_reuse=count_reuse,
+        )
+        wb = weight_dtype_bytes
+        M = len(self.bottom_even_memory_layers)
+        dense_memory_key_bytes = M * (self.mem_heads * self.mem_n_keys * self.mem_k_dim) * wb
+        binary_memory_key_bytes = M * (self.mem_heads * 2 * self.mem_k_dim) * wb
+        profile.ffn_bytes += (binary_memory_key_bytes - dense_memory_key_bytes)
+        profile.model_name = "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp"
+        profile.notes = (
+            f"phase={'hotcold+lora' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
+            f"mem_layers={self.bottom_even_memory_layers}; "
+            f"lora_ffn={self.lora_ffn_layers}; rank={self.lora_ffn_rank}; alpha={self.lora_ffn_alpha}; "
+            f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
+            f"binary_total_keys={self.mem_binary_total_keys}; "
+            f"binary_buckets={self.mem_binary_buckets}; "
+            f"top4_loopx{self.loop_repeats}"
+        )
+        return profile
+
+
 # ============================================================================
 # Factory
 # ============================================================================
@@ -4933,6 +5311,8 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_only_keys}
     if variant not in {
@@ -4945,6 +5325,8 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in hotcold_only_keys}
     if variant not in {
@@ -4956,6 +5338,8 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in twostage_only_keys}
     if variant not in {
@@ -4966,6 +5350,8 @@ def create_model(variant: str = "baseline", **kwargs):
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp",
     }:
         kwargs = {k: v for k, v in kwargs.items() if k not in mla_mem_monarch_only_keys}
 
@@ -4993,6 +5379,10 @@ def create_model(variant: str = "baseline", **kwargs):
         return MLAHybridLoop12MonarchAttnSVDFfnTransformer(**kwargs)
     elif variant == "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp":
         return MLAHybridLoop12MonarchAttnSVDFfnBinaryDPTransformer(**kwargs)
+    elif variant == "mla_hybrid_loop12_monarch_attn_lora_ffn":
+        return MLAHybridLoop12MonarchAttnLoRAFfnTransformer(**kwargs)
+    elif variant == "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp":
+        return MLAHybridLoop12MonarchAttnLoRAFfnBinaryDPTransformer(**kwargs)
     elif variant == "hotcold_svd":
         return HotColdSVDTransformer(**kwargs)
     elif variant == "twostage_svd":
@@ -5020,6 +5410,8 @@ if __name__ == "__main__":
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn",
+        "mla_hybrid_loop12_monarch_attn_lora_ffn_binarydp",
         "hotcold_svd",
         "twostage_svd",
         "loop_top4x3_attnres",
