@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import time
 import shutil
@@ -185,7 +186,7 @@ def compute_loss(model, batch, device):
 
 
 def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr: float) -> float:
-    """Linear warmup then linear decay (hits min_lr at final scheduled step)."""
+    """Linear warmup then cosine decay (hits min_lr at final scheduled step)."""
     if total_steps <= 1:
         return min_lr
 
@@ -193,11 +194,12 @@ def get_lr(step: int, warmup_steps: int, total_steps: int, max_lr: float, min_lr
     if warmup_steps > 0 and step < warmup_steps:
         return max_lr * (step + 1) / warmup_steps
 
-    # Ensure final scheduled step reaches min_lr exactly.
+    # Ensure final scheduled step reaches min_lr exactly with cosine anneal.
     decay_den = max(1, total_steps - warmup_steps - 1)
     decay_step = min(max(step - warmup_steps, 0), decay_den)
     decay_ratio = decay_step / decay_den
-    return max_lr - (max_lr - min_lr) * decay_ratio
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + (max_lr - min_lr) * cosine
 
 
 @torch.no_grad()
@@ -256,7 +258,7 @@ def train(
     model.train()
     raw_model = unwrap_model(model)
     num_params = raw_model.count_parameters(count_zeros=True)
-    min_lr = max_lr * 0.1
+    min_lr = max_lr * 0.2
 
     train_iter = iter(train_loader)
     running_loss = 0.0
@@ -268,8 +270,14 @@ def train(
     world_size = get_world_size(use_ddp)
     switched_to_svd = False
     svd_switch_step = None
+    reset_lr_on_structured_switch = False
+    is_lora_structured_model = hasattr(raw_model, "lora_ffn_layers")
     if hasattr(raw_model, "convert_full_to_hotcold_svd"):
         switch_frac = float(getattr(raw_model, "svd_switch_fraction", 0.5))
+        if is_lora_structured_model:
+            # LoRA hybrid path: force a dense warmup phase before enabling LoRA.
+            switch_frac = 0.20
+            reset_lr_on_structured_switch = True
         switch_frac = min(max(switch_frac, 0.0), 1.0)
         svd_switch_step = min(num_steps - 1, max(0, int(num_steps * switch_frac)))
 
@@ -282,16 +290,26 @@ def train(
             raw_model.convert_full_to_hotcold_svd()
             switched_to_svd = True
             if is_main(use_ddp):
-                print(f"\n  Switched embedding regime at step {step}: dense -> hot/cold SVD")
+                if is_lora_structured_model:
+                    print(f"\n  Switched LoRA regime at step {step}: dense-only -> dense+LoRA")
+                    print("  Resetting LR schedule from switch step for remaining training")
+                else:
+                    print(f"\n  Switched embedding regime at step {step}: dense -> hot/cold SVD")
 
-        if hold_min_after_first_epoch and first_epoch_steps is not None:
-            schedule_steps = max(1, min(num_steps, first_epoch_steps))
-            if step >= schedule_steps:
-                lr = min_lr
-            else:
-                lr = get_lr(step, warmup_steps, schedule_steps, max_lr, min_lr)
+        if reset_lr_on_structured_switch and switched_to_svd and svd_switch_step is not None:
+            # Restart warmup+decay schedule when LoRA gets activated.
+            phase_step = max(0, step - svd_switch_step)
+            phase_total_steps = max(1, num_steps - svd_switch_step)
+            lr = get_lr(phase_step, warmup_steps, phase_total_steps, max_lr, min_lr)
         else:
-            lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
+            if hold_min_after_first_epoch and first_epoch_steps is not None:
+                schedule_steps = max(1, min(num_steps, first_epoch_steps))
+                if step >= schedule_steps:
+                    lr = min_lr
+                else:
+                    lr = get_lr(step, warmup_steps, schedule_steps, max_lr, min_lr)
+            else:
+                lr = get_lr(step, warmup_steps, num_steps, max_lr, min_lr)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
@@ -621,12 +639,16 @@ def main():
     total_params = raw_model.count_parameters(count_zeros=True)
     nonzero_params = raw_model.count_parameters(count_zeros=False)
 
+    profile_count_reuse = hasattr(raw_model, "lora_ffn_layers")
+
     if is_main(use_ddp):
         print(f"  Total parameters:    {total_params:,}")
         print(f"  Non-zero parameters: {nonzero_params:,}")
 
         # Show the bytes_per_token_infer breakdown
-        profile = raw_model.get_inference_profile()
+        profile = raw_model.get_inference_profile(count_reuse=profile_count_reuse)
+        if profile_count_reuse:
+            print("  Profiling with count_reuse=True (shared LoRA FFN bases deduplicated).")
         print_profile(profile)
         post_switch_profile = None
         if hasattr(raw_model, "convert_full_to_hotcold_svd"):
@@ -635,7 +657,9 @@ def main():
             try:
                 preview_model = create_model(**model_kwargs)
                 preview_model.convert_full_to_hotcold_svd()
-                post_switch_profile = preview_model.get_inference_profile()
+                post_switch_profile = preview_model.get_inference_profile(
+                    count_reuse=profile_count_reuse
+                )
                 print("  Projected post-switch inference profile (dense->structured):")
                 print_profile(post_switch_profile)
                 del preview_model
@@ -700,7 +724,7 @@ def main():
         raw_model_final = unwrap_model(model)
         final_val_metrics = evaluate(model, val_loader, device)
         final_val_loss = final_val_metrics["loss"]
-        profile = raw_model_final.get_inference_profile()
+        profile = raw_model_final.get_inference_profile(count_reuse=profile_count_reuse)
         print("\n" + "=" * 60)
         print("  TRAINING COMPLETE")
         print("=" * 60)
@@ -709,7 +733,7 @@ def main():
             print(f"  Final val_hot_loss:     {final_val_metrics['hot_loss']:.4f}")
         if final_val_metrics["cold_loss"] is not None:
             print(f"  Final val_cold_loss:    {final_val_metrics['cold_loss']:.4f}")
-        print(f"  bytes_per_token_infer:  {profile.total_bytes:,} bytes")
+        print(f"  post bytes_per_token_infer:  {profile.total_bytes:,} bytes")
         print_profile(profile)
         if final_val_loss < GOAL_VAL_LOSS:
             print(f"  GOAL ACHIEVED!")

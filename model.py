@@ -4992,11 +4992,13 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
         self.lora_ffn_alpha = float(lora_ffn_alpha)
         # Architecture requested by user:
         # - memory layers: 1,3,5,7
-        # - shared dense FFN bases for pairs: (0,2), (4,6), (8,9), (10,11)
+        # - one shared dense FFN base across layers: 0,2,4,6
+        # - pair-shared dense FFN bases for: (8,9), (10,11)
         # - per-layer LoRA on every non-memory layer
         self.bottom_even_memory_layers = [1, 3, 5, 7]
         self.lora_ffn_layers = [0, 2, 4, 6, 8, 9, 10, 11]
-        shared_pairs = [(0, 2), (4, 6), (8, 9), (10, 11)]
+        shared_group = [0, 2, 4, 6]
+        shared_pairs = [(8, 9), (10, 11)]
 
         shared_value_store = (
             ProductKeyValueStore(self.mem_n_keys, self.mem_v_dim)
@@ -5018,6 +5020,20 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
                 )
             else:
                 self.layers[i].memory_layer = None
+
+        # Single dense base shared by all low non-memory layers.
+        group_dense = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
+        for i in shared_group:
+            ff_i = LoRASwiGLUFF(
+                d_model=self.d_model,
+                d_ff=self.d_ff,
+                lora_rank=self.lora_ffn_rank,
+                lora_alpha=self.lora_ffn_alpha,
+            )
+            ff_i.w1.base = group_dense.w1
+            ff_i.w2.base = group_dense.w2
+            ff_i.w3.base = group_dense.w3
+            self.layers[i].ff = ff_i
 
         for a, b in shared_pairs:
             shared_dense = SwiGLUFF(d_model=self.d_model, d_ff=self.d_ff)
@@ -5117,6 +5133,17 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
 
         attn_o_numel = 0
         ffn_numel = 0
+        seen_ffn_ptrs: set[int] | None = set() if count_reuse else None
+
+        def _accum_ffn_param(param: torch.Tensor) -> int:
+            if seen_ffn_ptrs is None:
+                return int(param.numel())
+            ptr = int(param.data_ptr())
+            if ptr in seen_ffn_ptrs:
+                return 0
+            seen_ffn_ptrs.add(ptr)
+            return int(param.numel())
+
         for layer in self.layers:
             attn = getattr(layer, "attn", None)
             proj = getattr(attn, "proj", None)
@@ -5124,10 +5151,21 @@ class MLAHybridLoop12MonarchAttnLoRAFfnTransformer(MLAHybridLoop12MonarchAttnSVD
                 attn_o_numel += sum(p.numel() for p in proj.parameters())
             if layer.memory_layer is not None:
                 continue
-            if isinstance(layer.ff, (SVDSwiGLUFF, LoRASwiGLUFF)):
+            if isinstance(layer.ff, LoRASwiGLUFF):
+                # Under count_reuse=True, shared dense bases are counted once by pointer.
+                for lin in (layer.ff.w1, layer.ff.w2, layer.ff.w3):
+                    ffn_numel += _accum_ffn_param(lin.base.weight)
+                    if lin.base.bias is not None:
+                        ffn_numel += _accum_ffn_param(lin.base.bias)
+                    if bool(lin.uses_lora_flag.item()):
+                        ffn_numel += _accum_ffn_param(lin.lora_down.weight)
+                        ffn_numel += _accum_ffn_param(lin.lora_up.weight)
+            elif isinstance(layer.ff, SVDSwiGLUFF):
+                # SVD FFN path has no intentional cross-layer sharing in this model.
                 ffn_numel += layer.ff.active_weight_numel()
             else:
-                ffn_numel += sum(p.numel() for p in layer.ff.parameters())
+                for p in layer.ff.parameters():
+                    ffn_numel += _accum_ffn_param(p)
         attn_o_bytes = attn_o_numel * wb
 
         dense_memory_query_bytes = M * (
