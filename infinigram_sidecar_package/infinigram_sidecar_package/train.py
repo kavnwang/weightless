@@ -392,6 +392,13 @@ def main():
     if args.model == "mla_hybrid_loop12_monarch" and args.d_ff == 2048:
         # Monarch FFN path in this variant is square: d_ff must match d_model.
         args.d_ff = args.d_model
+    if args.model in {
+        "mla_hybrid_loop12_monarch_attn_svd_ffn",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_nobinarydp",
+    } and args.d_ff == 2048:
+        # Keep this hybrid path at d_ff=1024 unless user explicitly overrides.
+        args.d_ff = 1024
     if args.dataset_epochs < 1:
         raise ValueError(f"--dataset_epochs must be >= 1, got {args.dataset_epochs}")
     user_set_num_steps = args.num_steps is not None
@@ -412,7 +419,7 @@ def main():
         args.num_steps = (total_tokens_target + tokens_per_step - 1) // tokens_per_step
     if args.eval_every is None:
         # Keep eval cadence tied to a single epoch, even for multi-epoch continuous runs.
-        args.eval_every = max(1, int(0.04 * steps_per_epoch))
+        args.eval_every = max(1, int(0.01 * steps_per_epoch))
     if args.svd_switch_fraction is None:
         args.svd_switch_fraction = (
             1.0 / 3.0

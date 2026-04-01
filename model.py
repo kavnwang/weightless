@@ -3679,8 +3679,8 @@ class MLAHybridLoop12Transformer(SimpleTransformer):
         self.loop_start = self.n_layers - self.loop_block_size
         self.attn_res_block_size = attn_res_block_size
 
-        self.bottom_even_memory_layers = [0, 2, 4, 6]
-        self.bottom_odd_svd_ffn_layers = [1, 3, 5, 7]
+        self.bottom_even_memory_layers = [1, 3, 5, 7]
+        self.bottom_odd_svd_ffn_layers = [2, 4, 6]
         self.top_even_monarch_layers = [8, 10]
         self.top_odd_svd_attn_layers = [9, 11]
 
