@@ -105,6 +105,40 @@ python eval.py --checkpoint model.pt
 python eval.py --checkpoint model.pt --visualize  # + save breakdown chart
 ```
 
+### InfiniGram sidecar (eval-time retrieval booster)
+
+Build a compact n-gram sidecar index from train data:
+
+```bash
+python build_infinigram_sidecar.py \
+  --out_dir sidecars/train_ngram_468 \
+  --split train \
+  --orders 4,6,8 \
+  --topk 8 \
+  --min_count 2 \
+  --batch_size 32
+```
+
+Evaluate with sidecar fusion (base model remains unchanged):
+
+```bash
+python eval.py \
+  --checkpoint checkpoints/my_model.pt \
+  --sidecar_dir sidecars/train_ngram_468 \
+  --sidecar_min_order 4 \
+  --sidecar_weight 0.70 \
+  --sidecar_min_model_prob 0.02 \
+  --sidecar_model_topk_agree 8 \
+  --sidecar_min_confidence 0.55 \
+  --sidecar_max_bytes_per_token 256
+```
+
+Behavior:
+- checks longest stored suffix first (`max_order -> min_order` backoff),
+- enforces a per-token sidecar byte budget,
+- only fuses when the base model also assigns meaningful probability to the same continuation,
+- otherwise falls back to base model predictions.
+
 ## Visualization
 
 Compare variants (including ablations) side-by-side:

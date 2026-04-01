@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -14,6 +15,11 @@ from tqdm import tqdm
 from data import get_dataloader
 from model import create_model
 from metric import print_profile
+from infinigram_sidecar import (
+    CompactNgramIndex,
+    InfinigramSidecarWrapper,
+    SidecarRuntimeConfig,
+)
 
 GOAL_VAL_LOSS = 3.5
 
@@ -40,13 +46,13 @@ def evaluate(model, dataloader, device):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             logits = model(input_ids, attention_mask)
         
-        token_losses = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            labels.reshape(-1),
-            reduction="none",
-        )
-
+        flat_output = logits.reshape(-1, logits.size(-1))
         flat_labels = labels.reshape(-1)
+        if bool(getattr(model, "returns_log_probs", False)):
+            token_losses = F.nll_loss(flat_output, flat_labels, reduction="none")
+        else:
+            token_losses = F.cross_entropy(flat_output, flat_labels, reduction="none")
+
         valid_mask = attention_mask.reshape(-1) > 0
         n_tokens = valid_mask.sum().item()
         total_loss += token_losses[valid_mask].sum().item()
@@ -99,10 +105,78 @@ def evaluate(model, dataloader, device):
     }
 
 
+def _load_checkpoint_config(config_path: str | None, checkpoint_path: str) -> dict | None:
+    candidates = []
+    if config_path is not None:
+        candidates.append(config_path)
+    if checkpoint_path:
+        if checkpoint_path.endswith(".pt"):
+            candidates.extend(
+                [
+                    checkpoint_path[:-3] + ".config.json",
+                    checkpoint_path[:-3] + ".meta.json",
+                ]
+            )
+    for cand in candidates:
+        try:
+            with open(cand, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            continue
+    return None
+
+
+def _apply_checkpoint_config(args) -> None:
+    if args.checkpoint is None:
+        return
+    payload = _load_checkpoint_config(args.checkpoint_config, args.checkpoint)
+    if payload is None:
+        return
+    model_kwargs = payload.get("model_kwargs", payload)
+    variant = payload.get("model_variant", model_kwargs.get("variant", payload.get("variant")))
+    if variant is not None:
+        args.model = variant
+    field_map = {
+        "d_model": "d_model",
+        "n_layers": "n_layers",
+        "n_heads": "n_heads",
+        "d_ff": "d_ff",
+        "kv_lora_rank": "kv_lora_rank",
+        "q_lora_rank": "q_lora_rank",
+        "qk_nope_head_dim": "qk_nope_head_dim",
+        "qk_rope_head_dim": "qk_rope_head_dim",
+        "v_head_dim": "v_head_dim",
+        "hot_token_k": "hot_token_k",
+        "cold_latent_dim": "cold_latent_dim",
+        "hot_token_cache_path": "hot_token_cache_path",
+        "svd_switch_fraction": "svd_switch_fraction",
+        "monarch_block_size": "monarch_block_size",
+        "memory_layers": "memory_layers",
+        "mem_n_keys": "mem_n_keys",
+        "mem_heads": "mem_heads",
+        "mem_knn": "mem_knn",
+        "mem_k_dim": "mem_k_dim",
+        "mem_v_dim": "mem_v_dim",
+        "mem_q_rank": "mem_q_rank",
+        "mem_share_values": "no_mem_share_values",
+        "qk_norm": "qk_norm",
+    }
+    for src, dst in field_map.items():
+        if src not in model_kwargs:
+            continue
+        value = model_kwargs[src]
+        if src == "mem_share_values":
+            setattr(args, dst, not bool(value))
+        else:
+            setattr(args, dst, value)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate model on FineWeb")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to model checkpoint (.pt file)")
+    parser.add_argument("--checkpoint_config", type=str, default=None,
+                        help="Optional JSON config for reconstructing checkpoint architecture")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--model", type=str, default="baseline",
                         choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "mla_twostage_svd_mem12_binarydp", "dp_shared_memory", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn", "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp"])
@@ -142,7 +216,21 @@ def main():
                         help="Context length for bytes_per_token_infer metric")
     parser.add_argument("--visualize", action="store_true",
                         help="Save a breakdown chart as PNG")
+    parser.add_argument("--sidecar_dir", type=str, default=None,
+                        help="Path to a built InfiniGram sidecar index directory")
+    parser.add_argument("--sidecar_min_order", type=int, default=4)
+    parser.add_argument("--sidecar_max_order", type=int, default=None)
+    parser.add_argument("--sidecar_weight", type=float, default=0.70)
+    parser.add_argument("--sidecar_temperature", type=float, default=1.0)
+    parser.add_argument("--sidecar_min_model_prob", type=float, default=0.02)
+    parser.add_argument("--sidecar_model_topk_agree", type=int, default=8)
+    parser.add_argument("--sidecar_require_argmax_agreement", action="store_true")
+    parser.add_argument("--sidecar_min_confidence", type=float, default=0.55)
+    parser.add_argument("--sidecar_min_count", type=int, default=2)
+    parser.add_argument("--sidecar_max_bytes_per_token", type=int, default=256)
+    parser.add_argument("--sidecar_apply_to_all_positions", action="store_true")
     args = parser.parse_args()
+    _apply_checkpoint_config(args)
     if args.model in {
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
@@ -207,6 +295,27 @@ def main():
         print("  Use --checkpoint model.pt to evaluate a trained model.")
     
     model.to(device)
+    model.eval()
+
+    sidecar_wrapper = None
+    if args.sidecar_dir:
+        index = CompactNgramIndex(args.sidecar_dir)
+        runtime_cfg = SidecarRuntimeConfig(
+            min_order=args.sidecar_min_order,
+            max_order=args.sidecar_max_order,
+            sidecar_weight=args.sidecar_weight,
+            sidecar_temperature=args.sidecar_temperature,
+            min_model_prob=args.sidecar_min_model_prob,
+            model_topk_agree=args.sidecar_model_topk_agree,
+            require_argmax_agreement=args.sidecar_require_argmax_agreement,
+            min_sidecar_confidence=args.sidecar_min_confidence,
+            min_count=args.sidecar_min_count,
+            max_sidecar_bytes_per_token=args.sidecar_max_bytes_per_token,
+            apply_to_last_token_only=not args.sidecar_apply_to_all_positions,
+        )
+        sidecar_wrapper = InfinigramSidecarWrapper(model, index, runtime_cfg)
+        sidecar_wrapper.to(device)
+        sidecar_wrapper.eval()
     
     # Data
     print("  Loading validation data...")
@@ -214,7 +323,8 @@ def main():
     
     # Evaluate
     print("  Evaluating...")
-    metrics = evaluate(model, val_loader, device)
+    eval_model = sidecar_wrapper if sidecar_wrapper is not None else model
+    metrics = evaluate(eval_model, val_loader, device)
     
     # Print results
     print("\n" + "=" * 60)
@@ -230,10 +340,25 @@ def main():
     print(f"  Non-zero Params:    {metrics['nonzero_params']:,}")
     print(f"  Sparsity:           {metrics['sparsity']:.2%}")
     print(f"  Evaluated Tokens:   {metrics['n_tokens']:,}")
+    if sidecar_wrapper is not None:
+        stats = sidecar_wrapper.stats.as_dict()
+        print(f"  Sidecar lookups:    {stats['lookup_attempts']:,}")
+        print(f"  Sidecar hits:       {stats['lookup_hits']:,}")
+        print(f"  Sidecar fused:      {stats['fused']:,}")
+        print(f"  Sidecar bytes read: {stats['bytes_read']:,}")
     
     # bytes_per_token_infer breakdown
     profile = model.get_inference_profile(seq_len=args.seq_len)
     print_profile(profile)
+    if sidecar_wrapper is not None:
+        print(
+            "  sidecar_extra_bytes_per_token_infer: "
+            f"{sidecar_wrapper.extra_bytes_per_token_infer:,} bytes"
+        )
+        print(
+            "  worst_case_total_bytes_per_token_infer: "
+            f"{profile.total_bytes + sidecar_wrapper.extra_bytes_per_token_infer:,} bytes"
+        )
     
     # Goal check
     print("=" * 60)

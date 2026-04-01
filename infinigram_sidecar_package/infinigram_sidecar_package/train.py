@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import time
-import shutil
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -64,79 +63,6 @@ def unwrap_model(model):
     if hasattr(raw, "_orig_mod"):
         raw = raw._orig_mod
     return raw
-
-
-def _format_bytes(num_bytes: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(max(0, num_bytes))
-    unit = units[0]
-    for candidate in units:
-        unit = candidate
-        if value < 1024.0 or candidate == units[-1]:
-            break
-        value /= 1024.0
-    return f"{value:.2f} {unit}"
-
-
-def _estimate_state_dict_bytes(state_dict: dict[str, torch.Tensor]) -> int:
-    total = 0
-    for tensor in state_dict.values():
-        if not isinstance(tensor, torch.Tensor):
-            continue
-        total += tensor.numel() * tensor.element_size()
-    return int(total)
-
-
-def _safe_save_checkpoint(
-    state_dict: dict[str, torch.Tensor],
-    ckpt_path: str,
-    fallback_dir: str | None = None,
-) -> str:
-    estimate = _estimate_state_dict_bytes(state_dict)
-    parent_dirs: list[str] = []
-    primary_dir = os.path.dirname(ckpt_path) or "."
-    parent_dirs.append(primary_dir)
-    if fallback_dir:
-        parent_dirs.append(fallback_dir)
-
-    attempted: list[str] = []
-    for out_dir in parent_dirs:
-        os.makedirs(out_dir, exist_ok=True)
-        final_path = os.path.join(out_dir, os.path.basename(ckpt_path))
-        attempted.append(final_path)
-
-        usage = shutil.disk_usage(out_dir)
-        reserve = max(2 * 1024**3, int(estimate * 0.15))
-        required = estimate + reserve
-        if usage.free < required:
-            print(
-                f"  Checkpoint skip at {final_path}: free={_format_bytes(usage.free)} "
-                f"< required~{_format_bytes(required)} (estimate={_format_bytes(estimate)})"
-            )
-            continue
-
-        tmp_path = f"{final_path}.tmp-{os.getpid()}"
-        try:
-            torch.save(state_dict, tmp_path)
-            os.replace(tmp_path, final_path)
-            return final_path
-        except (RuntimeError, OSError) as e:
-            msg = str(e)
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            if "file write failed" in msg or "unexpected pos" in msg or "No space left on device" in msg:
-                print(f"  Checkpoint write failed at {final_path}: {msg}")
-                continue
-            raise
-
-    raise RuntimeError(
-        "Failed to save checkpoint in all candidate locations: "
-        + ", ".join(attempted)
-        + ". Set --checkpoint_dir to a volume with enough space."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +171,13 @@ def train(
     num_steps: int = 5000,
     eval_every: int = 50,
     max_lr: float = 1e-3,
-    warmup_steps: int = 100,
-    grad_clip: float = 1.0,
+    warmup_steps: int = 25,
     use_wandb: bool = True,
     use_ddp: bool = False,
     first_epoch_steps: int | None = None,
     hold_min_after_first_epoch: bool = False,
 ):
-    """Main training loop with train logging every eval_every steps."""
+    """Main training loop with logging every eval_every steps."""
     model.train()
     raw_model = unwrap_model(model)
     num_params = raw_model.count_parameters(count_zeros=True)
@@ -309,8 +234,6 @@ def train(
         optimizer.zero_grad()
         loss, hot_loss, cold_loss = compute_loss(model, batch, device)
         loss.backward()
-        if grad_clip is not None and grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
 
         running_loss += loss.item()
@@ -331,15 +254,21 @@ def train(
             train_loss = running_loss / eval_every
             train_hot_loss = (running_hot_loss / hot_batches) if hot_batches > 0 else None
             train_cold_loss = (running_cold_loss / cold_batches) if cold_batches > 0 else None
+            val_metrics = evaluate(model, val_loader, device)
+            val_loss = val_metrics["loss"]
             raw_model = unwrap_model(model)
             nonzero_params = raw_model.count_parameters(count_zeros=False)
 
             if is_main(use_ddp):
-                postfix = {"train": f"{train_loss:.3f}", "mfu": f"{mfu:.1%}"}
+                postfix = {"train": f"{train_loss:.3f}", "val": f"{val_loss:.3f}", "mfu": f"{mfu:.1%}"}
                 if train_hot_loss is not None:
                     postfix["train_hot"] = f"{train_hot_loss:.3f}"
                 if train_cold_loss is not None:
                     postfix["train_cold"] = f"{train_cold_loss:.3f}"
+                if val_metrics["hot_loss"] is not None:
+                    postfix["val_hot"] = f"{val_metrics['hot_loss']:.3f}"
+                if val_metrics["cold_loss"] is not None:
+                    postfix["val_cold"] = f"{val_metrics['cold_loss']:.3f}"
                 pbar.set_postfix(postfix)
                 if use_wandb:
                     import wandb
@@ -349,6 +278,7 @@ def train(
                         "train/total_tokens": total_tokens,
                         "train/total_flops": total_flops,
                         "train/epoch": epoch,
+                        "val/loss": val_loss,
                         "params/nonzero": nonzero_params,
                         "mfu": mfu,
                         "step": step + 1,
@@ -357,7 +287,13 @@ def train(
                         log_payload["train/hot_loss"] = train_hot_loss
                     if train_cold_loss is not None:
                         log_payload["train/cold_loss"] = train_cold_loss
+                    if val_metrics["hot_loss"] is not None:
+                        log_payload["val/hot_loss"] = val_metrics["hot_loss"]
+                    if val_metrics["cold_loss"] is not None:
+                        log_payload["val/cold_loss"] = val_metrics["cold_loss"]
                     wandb.log(log_payload)
+                if val_loss < GOAL_VAL_LOSS:
+                    print(f"\n  Goal achieved! val_loss={val_loss:.4f} < {GOAL_VAL_LOSS} with {nonzero_params:,} non-zero params")
 
             running_loss = 0.0
             running_hot_loss = 0.0
@@ -377,9 +313,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_lr", type=float, default=1e-3)
-    parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--no_pin_memory", action="store_true")
     parser.add_argument("--no_persistent_workers", action="store_true")
     parser.add_argument("--num_steps", type=int, default=None)
@@ -395,7 +329,7 @@ def main():
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--model", type=str, default="baseline",
-                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "mla_twostage_svd_mem12_binarydp", "dp_shared_memory", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn", "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp"],
+                        choices=["baseline", "gqa_only", "topk_only", "baseline_plus", "mla", "hotcold_mla", "hotcold_mla_svdffn96", "hotcold_mla_svdffn96_loop_top4x3_attnres", "hotcold_svd", "twostage_svd", "mla_twostage_svd_mem12_monarch", "mla_twostage_svd_mem12_binarydp", "dp_shared_memory", "dp_shared_mem6_top2_loop3_svdffn128", "loop_top4x3_attnres", "mla_hybrid_loop12", "mla_hybrid_loop12_monarch", "mla_hybrid_loop12_monarch_attn_svd_ffn", "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp", "mla_hybrid_loop12_monarch_attn_svd_ffn_nobinarydp", "infinigram"],
                         help="Model variant")
     parser.add_argument("--kv_lora_rank", type=int, default=None,
                         help="MLA KV latent rank (d_c); used for --model mla/hotcold_mla")
@@ -414,7 +348,7 @@ def main():
     parser.add_argument("--hot_token_cache_path", type=str, default="cache/hot_tokens_train1p3b_top2000.pt",
                         help="Path to cached hot tokens from build_hot_token_cache.py")
     parser.add_argument("--svd_switch_fraction", type=float, default=None,
-                        help="For twostage_svd/hotcold_mla/mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn/mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp: fraction of total steps before switching dense -> hot/cold SVD")
+                        help="For twostage_svd/hotcold_mla/hotcold_mla_svdffn96/hotcold_mla_svdffn96_loop_top4x3_attnres/mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp/mla_hybrid_loop12/mla_hybrid_loop12_monarch/mla_hybrid_loop12_monarch_attn_svd_ffn/mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp/mla_hybrid_loop12_monarch_attn_svd_ffn_nobinarydp: fraction of total steps before switching dense -> hot/cold SVD")
     parser.add_argument("--monarch_block_size", type=int, default=32,
                         help="Monarch block size for MLA O-proj in mla_twostage_svd_mem12_monarch/mla_twostage_svd_mem12_binarydp")
     parser.add_argument("--memory_layers", type=int, default=12,
@@ -435,27 +369,23 @@ def main():
                         help="Disable shared value table across memory layers")
     parser.add_argument("--qk_norm", action="store_true",
                         help="Enable RMS q/k normalization in memory lookups")
+    parser.add_argument("--infinigram_index_dir", type=str, default=None,
+                        help="Path to an infini-gram index directory (used only for --model infinigram)")
     parser.add_argument("--wandb_project", type=str, default="weightless")
     parser.add_argument("--wandb_entity", type=str, default="kavn",
                         help="W&B workspace/entity to log runs to")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Name for this run (used for checkpoint filename)")
-    parser.set_defaults(save_checkpoint=True)
-    parser.add_argument("--save_checkpoint", dest="save_checkpoint", action="store_true",
-                        help="Save model checkpoint at end of training (default: enabled)")
-    parser.add_argument("--no_save_checkpoint", dest="save_checkpoint", action="store_false",
-                        help="Disable end-of-training checkpoint save")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
-                        help="Primary directory for end-of-training checkpoint files")
-    parser.add_argument("--checkpoint_fallback_dir", type=str, default=None,
-                        help="Optional fallback directory if primary checkpoint write fails")
+    parser.add_argument("--save_checkpoint", action="store_true",
+                        help="Save model checkpoint at end of training")
     args = parser.parse_args()
     if args.model in {
         "mla_hybrid_loop12",
         "mla_hybrid_loop12_monarch",
         "mla_hybrid_loop12_monarch_attn_svd_ffn",
         "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+        "mla_hybrid_loop12_monarch_attn_svd_ffn_nobinarydp",
     } and args.n_layers == 8:
         # Keep CLI ergonomic: these variants are fixed to 12 layers.
         args.n_layers = 12
@@ -487,10 +417,13 @@ def main():
         args.svd_switch_fraction = (
             1.0 / 3.0
             if args.model in {
+                "hotcold_mla_svdffn96",
+                "hotcold_mla_svdffn96_loop_top4x3_attnres",
                 "mla_hybrid_loop12",
                 "mla_hybrid_loop12_monarch",
                 "mla_hybrid_loop12_monarch_attn_svd_ffn",
                 "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+                "mla_hybrid_loop12_monarch_attn_svd_ffn_nobinarydp",
             }
             else 0.5
         )
@@ -573,22 +506,31 @@ def main():
         mem_q_rank=args.mem_q_rank,
         mem_share_values=not args.no_mem_share_values,
         qk_norm=args.qk_norm,
+        infinigram_index_dir=args.infinigram_index_dir,
     )
     model = create_model(**model_kwargs)
     model.to(device)
-    model = torch.compile(model)
+    if args.model == "infinigram":
+        if is_main(use_ddp):
+            print("  Skipping torch.compile for infinigram retrieval model.")
+    else:
+        model = torch.compile(model)
 
     if use_ddp:
         from torch.nn.parallel import DistributedDataParallel as DDP
         ddp_find_unused = args.model in {
             "twostage_svd",
             "hotcold_mla",
+            "hotcold_mla_svdffn96",
+            "hotcold_mla_svdffn96_loop_top4x3_attnres",
             "mla_twostage_svd_mem12_monarch",
             "mla_twostage_svd_mem12_binarydp",
+            "dp_shared_mem6_top2_loop3_svdffn128",
             "mla_hybrid_loop12",
             "mla_hybrid_loop12_monarch",
             "mla_hybrid_loop12_monarch_attn_svd_ffn",
             "mla_hybrid_loop12_monarch_attn_svd_ffn_binarydp",
+            "mla_hybrid_loop12_monarch_attn_svd_ffn_nobinarydp",
         }
         model = DDP(
             model,
@@ -669,8 +611,6 @@ def main():
         num_steps=args.num_steps,
         eval_every=args.eval_every,
         max_lr=args.max_lr,
-        warmup_steps=args.warmup_steps,
-        grad_clip=args.grad_clip,
         use_wandb=use_wandb,
         use_ddp=use_ddp,
         first_epoch_steps=steps_per_epoch,
@@ -701,28 +641,24 @@ def main():
 
         # Save checkpoint
         if args.save_checkpoint:
-            ckpt_path = f"{args.checkpoint_dir}/{args.run_name}.pt"
-            try:
-                saved_path = _safe_save_checkpoint(
-                    raw_model_final.state_dict(),
-                    ckpt_path=ckpt_path,
-                    fallback_dir=args.checkpoint_fallback_dir,
+            import os
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_path = f"checkpoints/{args.run_name}.pt"
+            cfg_path = f"checkpoints/{args.run_name}.config.json"
+            torch.save(raw_model_final.state_dict(), ckpt_path)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "model_variant": args.model,
+                        "model_kwargs": model_kwargs,
+                        "train_args": vars(args),
+                    },
+                    f,
+                    indent=2,
+                    sort_keys=True,
                 )
-                print(f"  Checkpoint saved to {saved_path}")
-                config_path = os.path.splitext(saved_path)[0] + ".config.json"
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "model_variant": args.model,
-                            "model_kwargs": model_kwargs,
-                        },
-                        f,
-                        indent=2,
-                    )
-                print(f"  Checkpoint config saved to {config_path}")
-            except Exception as e:
-                # End-of-training checkpoint failure should not crash the whole run.
-                print(f"  WARNING: checkpoint save failed: {e}")
+            print(f"  Checkpoint saved to {ckpt_path}")
+            print(f"  Checkpoint config saved to {cfg_path}")
 
     if use_wandb and is_main(use_ddp):
         import wandb
