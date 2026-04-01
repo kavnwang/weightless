@@ -1664,7 +1664,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, n_kv_heads: int,
                  d_ff: int, dropout: float, ffn_top_k: int | None = None,
                  attention_type: str = "mha", mla_kwargs: dict | None = None,
-                 monarch_kwargs: dict | None = None, memory_layer: nn.Module | None = None):
+                 monarch_kwargs: dict | None = None, svd_kwargs: dict | None = None,
+                 memory_layer: nn.Module | None = None):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         if attention_type == "mla":
@@ -1688,6 +1689,18 @@ class TransformerBlock(nn.Module):
                 **mla_kwargs,
                 **monarch_kwargs,
             )
+        elif attention_type == "mla_svd":
+            if mla_kwargs is None:
+                raise ValueError("mla_kwargs must be provided when attention_type='mla_svd'")
+            if svd_kwargs is None:
+                svd_kwargs = {}
+            self.attn = MultiLatentAttentionSVD(
+                d_model=d_model,
+                n_heads=n_heads,
+                dropout=dropout,
+                **mla_kwargs,
+                **svd_kwargs,
+            )
         else:
             self.attn = MultiHeadAttention(d_model, n_heads, n_kv_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
@@ -1704,6 +1717,12 @@ class TransformerBlock(nn.Module):
         ff_in = self.ln2(x)
         x = x + (self.memory_layer(ff_in) if self.memory_layer is not None else self.ff(ff_in))
         return x
+
+    def convert_full_to_svd(self):
+        if hasattr(self.attn, "convert_full_to_svd"):
+            self.attn.convert_full_to_svd()
+        if self.ff is not None and hasattr(self.ff, "convert_full_to_svd"):
+            self.ff.convert_full_to_svd()
 
 
 # ============================================================================
@@ -2528,7 +2547,7 @@ class HotColdMLATransformer(SimpleTransformer):
 
 
 class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
-    """MLA + two-stage dense->hot/cold SVD + 12 all-memory layers + Monarch O-proj."""
+    """MLA + two-stage dense->hot/cold SVD + 12 all-memory layers + SVD O-proj."""
 
     def __init__(
         self,
@@ -2550,6 +2569,7 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
         hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
         svd_switch_fraction: float = 0.5,
         monarch_block_size: int = 32,
+        svd_attn_rank: int | None = None,
         memory_layers: int | list[int] | tuple[int, ...] = 12,
         mem_n_keys: int = 256,
         mem_heads: int = 4,
@@ -2589,7 +2609,8 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
         self.svd_switch_fraction = svd_switch_fraction
         self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
 
-        self.monarch_block_size = monarch_block_size
+        self.monarch_block_size = monarch_block_size  # kept for CLI compatibility; unused
+        self.svd_attn_rank = svd_attn_rank if svd_attn_rank is not None else max(16, d_model // 2)
         self.mem_n_keys = mem_n_keys
         self.mem_heads = mem_heads
         self.mem_knn = mem_knn
@@ -2672,9 +2693,9 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
                     n_heads,
                     d_ff,
                     dropout,
-                    attention_type="mla_monarch",
+                    attention_type="mla_svd",
                     mla_kwargs=mla_kwargs,
-                    monarch_kwargs={"monarch_block_size": self.monarch_block_size},
+                    svd_kwargs={"svd_rank": self.svd_attn_rank},
                     memory_layer=memory_layer,
                 )
             )
@@ -2707,6 +2728,8 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
                 Vh_r.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
             )
             self.full_token_emb.weight.requires_grad_(False)
+            for layer in self.layers:
+                layer.convert_full_to_svd()
             self.uses_hotcold_flag.fill_(True)
 
     def token_partition_masks(self, token_ids: torch.Tensor):
@@ -2766,14 +2789,16 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
         attn_k_bytes = L * (d * dc + dc * (h * d_nope) + d * d_rope) * wb
         attn_v_bytes = L * (dc * (h * d_v)) * wb
 
-        # Monarch O-proj bytes: read two block-factor tensors (left/right).
-        monarch_proj_numel = 0
+        attn_proj_numel = 0
         for layer in self.layers:
             attn = getattr(layer, "attn", None)
             proj = getattr(attn, "proj", None)
             if proj is not None:
-                monarch_proj_numel += sum(p.numel() for p in proj.parameters())
-        attn_o_bytes = monarch_proj_numel * wb
+                if hasattr(proj, "active_weight_numel"):
+                    attn_proj_numel += int(proj.active_weight_numel())
+                else:
+                    attn_proj_numel += sum(p.numel() for p in proj.parameters())
+        attn_o_bytes = attn_proj_numel * wb
 
         dense_ffn_bytes = dense_L * (d * self.d_ff + self.d_ff * d + d * self.d_ff) * wb
         memory_query_bytes = M * (
@@ -2830,14 +2855,14 @@ class MLATwoStageSVDMemoryMonarchTransformer(SimpleTransformer):
             unique_opt_state_bytes=unique_numel * 12,
             notes=(
                 f"phase={'hotcold' if bool(self.uses_hotcold_flag.item()) else 'dense'}; "
-                f"mem_layers={self.memory_layer_indices}; monarch_bs={self.monarch_block_size}; "
+                f"mem_layers={self.memory_layer_indices}; svd_attn_rank={self.svd_attn_rank}; "
                 f"mem_q_rank={self.mem_q_rank}"
             ),
         )
 
 
 class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
-    """MLA + dense->hot/cold SVD + 12 binary-DP memory layers + Monarch O-proj."""
+    """MLA + dense->hot/cold SVD + 12 binary-DP memory layers + SVD O-proj."""
 
     def __init__(
         self,
@@ -2859,6 +2884,7 @@ class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
         hot_token_cache_path: str = DEFAULT_HOT_TOKEN_CACHE_PATH,
         svd_switch_fraction: float = 0.5,
         monarch_block_size: int = 32,
+        svd_attn_rank: int | None = None,
         memory_layers: int | list[int] | tuple[int, ...] = 12,
         mem_n_keys: int = 256,
         mem_heads: int = 4,
@@ -2898,7 +2924,8 @@ class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
         self.svd_switch_fraction = svd_switch_fraction
         self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
 
-        self.monarch_block_size = monarch_block_size
+        self.monarch_block_size = monarch_block_size  # kept for CLI compatibility; unused
+        self.svd_attn_rank = svd_attn_rank if svd_attn_rank is not None else max(16, d_model // 2)
         self.mem_n_keys = mem_n_keys
         self.mem_heads = mem_heads
         self.mem_knn = mem_knn
@@ -2993,9 +3020,9 @@ class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
                     n_heads,
                     d_ff,
                     dropout,
-                    attention_type="mla_monarch",
+                    attention_type="mla_svd",
                     mla_kwargs=mla_kwargs,
-                    monarch_kwargs={"monarch_block_size": self.monarch_block_size},
+                    svd_kwargs={"svd_rank": self.svd_attn_rank},
                     memory_layer=memory_layer,
                 )
             )
@@ -3028,6 +3055,8 @@ class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
                 Vh_r.T.to(self.token_emb.cold_latent_to_model.weight.dtype)
             )
             self.full_token_emb.weight.requires_grad_(False)
+            for layer in self.layers:
+                layer.convert_full_to_svd()
             self.uses_hotcold_flag.fill_(True)
 
     def token_partition_masks(self, token_ids: torch.Tensor):
@@ -3087,13 +3116,16 @@ class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
         attn_k_bytes = L * (d * dc + dc * (h * d_nope) + d * d_rope) * wb
         attn_v_bytes = L * (dc * (h * d_v)) * wb
 
-        monarch_proj_numel = 0
+        attn_proj_numel = 0
         for layer in self.layers:
             attn = getattr(layer, "attn", None)
             proj = getattr(attn, "proj", None)
             if proj is not None:
-                monarch_proj_numel += sum(p.numel() for p in proj.parameters())
-        attn_o_bytes = monarch_proj_numel * wb
+                if hasattr(proj, "active_weight_numel"):
+                    attn_proj_numel += int(proj.active_weight_numel())
+                else:
+                    attn_proj_numel += sum(p.numel() for p in proj.parameters())
+        attn_o_bytes = attn_proj_numel * wb
 
         dense_ffn_bytes = dense_L * (d * self.d_ff + self.d_ff * d + d * self.d_ff) * wb
         memory_query_bytes = M * (
@@ -3151,7 +3183,7 @@ class MLATwoStageSVDBinaryMemoryMonarchTransformer(SimpleTransformer):
             unique_opt_state_bytes=unique_numel * 12,
             notes=(
                 f"phase={'hotcold' if bool(self.uses_hotcold_flag.item()) else 'dense'}; "
-                f"mem_layers={self.memory_layer_indices}; monarch_bs={self.monarch_block_size}; "
+                f"mem_layers={self.memory_layer_indices}; svd_attn_rank={self.svd_attn_rank}; "
                 f"binary_total_keys={self.mem_binary_total_keys}; binary_buckets={self.mem_binary_buckets}; "
                 f"mem_q_rank={self.mem_q_rank}"
             ),
@@ -4491,10 +4523,12 @@ class MLAHybridLoop12MonarchAttnSVDFfnTransformer(SimpleTransformer):
         self.bottom_odd_svd_ffn_layers = [1, 3, 5, 7]
         self.top_even_monarch_layers = [8, 10]
         self.top_odd_monarch_layers = [9, 11]
+        # Keep one looped SwiGLU dense (layer 11) for a mixed loop FFN stack.
+        self.loop_dense_ffn_layers = [11]
         self.svd_ffn_layers = (
             self.bottom_odd_svd_ffn_layers
             + self.top_even_monarch_layers
-            + self.top_odd_monarch_layers
+            + [i for i in self.top_odd_monarch_layers if i not in self.loop_dense_ffn_layers]
         )
 
         self.register_buffer("uses_hotcold_flag", torch.tensor(False, dtype=torch.bool), persistent=True)
@@ -4778,6 +4812,7 @@ class MLAHybridLoop12MonarchAttnSVDFfnTransformer(SimpleTransformer):
                 f"phase={'hotcold+svd' if bool(self.uses_structured_svd_flag.item()) else 'dense'}; "
                 f"mem_layers={self.bottom_even_memory_layers}; "
                 f"svd_ffn={self.svd_ffn_layers}; "
+                f"dense_loop_ffn={self.loop_dense_ffn_layers}; "
                 f"top_monarch_attn={self.top_even_monarch_layers + self.top_odd_monarch_layers}; "
                 f"top4_loopx{self.loop_repeats}"
             ),

@@ -181,7 +181,7 @@ Five model variants are provided:
 | `baseline_plus` | GQA + top-k FFN | **153 MB** (-21%) | Fewer KV heads, activation sparsity in FFN |
 | `mla` | DeepSeek-style latent attention | Depends on MLA dims | Low-rank Q/KV compression and reduced KV cache payload |
 | `hotcold_mla` | MLA + hot/cold vocab SVD | Depends on MLA + rank | MLA attention plus hot dense and cold low-rank vocab factors |
-| `mla_twostage_svd_mem12_monarch` | MLA + mid-switch SVD + mem12 + Monarch | Depends on dims | Dense vocab warmup then hot/cold SVD; 12 PK memory layers; Monarch O-proj |
+| `mla_twostage_svd_mem12_monarch` | MLA + mid-switch SVD + mem12 + SVD O-proj | Depends on dims | Dense vocab warmup then hot/cold SVD; 12 PK memory layers; SVD-switched O-proj |
 | `mla_twostage_svd_mem12_binarydp` | MLA + mid-switch SVD + mem12 + binary-DP memory | Depends on dims | Replaces 2-way PK retrieval with exact binary product-code top-k dynamic programming |
 | `dp_shared_memory` | Dense attention + binary-DP shared memory | Depends on dims | Removes MLA/SVD; keeps shared binary-DP memory layers as FF branch replacement |
 | `hotcold_svd` | Hot dense + cold SVD vocab | Depends on hot_k/rank | Top-2000 tokens dense, cold tokens rank-128 factors (tied embed/unembed) |
