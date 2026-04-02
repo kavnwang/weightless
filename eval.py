@@ -46,28 +46,11 @@ def evaluate(
     model,
     dataloader,
     device,
-    ttt_steps: int = 0,
-    ttt_lr: float = 1e-5,
-    ttt_weight_decay: float = 0.0,
-    ttt_grad_clip: float = 1.0,
     max_eval_batches: int | None = None,
 ):
     """Evaluate model and return metrics."""
     model.eval()
     model.to(device)
-
-    ttt_enabled = ttt_steps > 0
-    ttt_optimizer = None
-    if ttt_enabled:
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        if len(trainable_params) == 0:
-            raise ValueError("TTT requested, but model has no trainable parameters.")
-        ttt_optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=ttt_lr,
-            weight_decay=ttt_weight_decay,
-            betas=(0.9, 0.95),
-        )
 
     total_loss = 0.0
     total_hot_loss = 0.0
@@ -115,25 +98,6 @@ def evaluate(
                     ).item()
                     total_cold_tokens += cold_mask.sum().item()
         n_batches += 1
-
-        if ttt_enabled:
-            model.train()
-            for _ in range(ttt_steps):
-                ttt_optimizer.zero_grad(set_to_none=True)
-                with _autocast_context(device):
-                    ttt_logits = model(input_ids, attention_mask)
-                ttt_token_losses, ttt_valid_mask, _ = _token_losses_from_logits(
-                    model, ttt_logits, labels, attention_mask
-                )
-                if ttt_valid_mask.any():
-                    ttt_loss = ttt_token_losses[ttt_valid_mask].mean()
-                else:
-                    ttt_loss = ttt_token_losses.mean()
-                ttt_loss.backward()
-                if ttt_grad_clip is not None and ttt_grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=ttt_grad_clip)
-                ttt_optimizer.step()
-            model.eval()
 
         if max_eval_batches is not None and n_batches >= max_eval_batches:
             break
@@ -291,14 +255,6 @@ def main():
     parser.add_argument("--sidecar_min_count", type=int, default=2)
     parser.add_argument("--sidecar_max_bytes_per_token", type=int, default=256)
     parser.add_argument("--sidecar_apply_to_all_positions", action="store_true")
-    parser.add_argument("--ttt_steps", type=int, default=0,
-                        help="Number of test-time training optimizer steps per eval batch")
-    parser.add_argument("--ttt_lr", type=float, default=1e-5,
-                        help="Learning rate for TTT optimizer")
-    parser.add_argument("--ttt_weight_decay", type=float, default=0.0,
-                        help="Weight decay for TTT optimizer")
-    parser.add_argument("--ttt_grad_clip", type=float, default=1.0,
-                        help="Gradient clipping max norm for TTT (<=0 disables clipping)")
     parser.add_argument("--max_eval_batches", type=int, default=None,
                         help="Optional cap on number of eval batches")
     args = parser.parse_args()
@@ -384,8 +340,6 @@ def main():
 
     sidecar_wrapper = None
     if args.sidecar_dir:
-        if args.ttt_steps > 0:
-            raise ValueError("TTT is not supported together with sidecar fusion in eval.py")
         index = CompactNgramIndex(args.sidecar_dir)
         runtime_cfg = SidecarRuntimeConfig(
             min_order=args.sidecar_min_order,
@@ -415,10 +369,6 @@ def main():
         eval_model,
         val_loader,
         device,
-        ttt_steps=args.ttt_steps,
-        ttt_lr=args.ttt_lr,
-        ttt_weight_decay=args.ttt_weight_decay,
-        ttt_grad_clip=args.ttt_grad_clip,
         max_eval_batches=args.max_eval_batches,
     )
     
